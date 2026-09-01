@@ -16,8 +16,8 @@ per-fan telemetry. This wraps all of it in one CLI and one panel.
 ## Install
 
 ```bash
-git clone <this-repo> ~/Work/lenovo-power
-cd ~/Work/lenovo-power
+git clone git@github.com:rwildcard/lenovo-power.git
+cd lenovo-power
 ./install.sh            # symlinks bin/* into ~/.local/bin
 lenovo-power install-perms   # one-time, asks for your password
 ```
