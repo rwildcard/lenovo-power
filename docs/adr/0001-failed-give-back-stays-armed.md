@@ -18,7 +18,10 @@ outcomes, even though both keep the entry armed.
 
 ## Consequences
 
-An entry can stay armed indefinitely if its reversal never succeeds. That is
-deliberate: the guard polls every ten seconds, so a retry is cheap, and a
-permanently failing reversal is a condition worth leaving visible in the armed
-set rather than silently discarding.
+An entry can stay armed indefinitely if its reversal never succeeds. The retry
+is not the next poll: `monitor_poll` clears the sustain timer whenever the
+guard fires, so the next attempt waits for another full `GUARD_SUSTAIN` of
+continuous heat, and a machine that cools in between waits for the hot episode
+after that. The armed set is therefore a record, not a fast retry queue. That
+is accepted, because a reversal that keeps failing is worth leaving visible in
+the armed set rather than silently discarding.

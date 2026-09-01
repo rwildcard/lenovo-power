@@ -39,10 +39,11 @@ setting's value from before the raise.
 _Avoid_: ledger, restore list, pending set
 
 **give back**:
-The guard's reversal of a raise. Deliberately not a return to the recorded prior
-value: the platform profile goes to `performance`, and the dGPU cap goes to the
-card's default.
-_Avoid_: restore, revert, roll back (each promises the prior value)
+The guard's reversal of a raise. Where it goes is the setting's own business:
+the CPU limits return to their recorded prior values, while the platform
+profile goes to `performance` and the dGPU cap to the card's default.
+_Avoid_: restore, revert, roll back (each promises the prior value, which two
+of the four settings do not go back to)
 
 **the guard**:
 The policy that gives back raises when the CPU stays hot. It is a comfort and

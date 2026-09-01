@@ -249,9 +249,11 @@ to_bool() {
 #   budget_plan_<key> <prior>      how to say what would be given back
 #   budget_reverse_<key> <prior>   give it back, and say what was given back
 #
-# A reverse handler returns 0 when it gave the setting back, 1 when it tried
-# and failed, and 2 when it cannot try yet. Only 0 disarms the entry: a failure
-# or a deferral stays armed for the next poll (docs/adr/0001).
+# A reverse handler returns 0 when it gave the setting back, and only that
+# disarms the entry. Any other status leaves it armed for a later trigger
+# (docs/adr/0001); handlers use 1 for a reversal that was tried and failed and
+# 2 for one that cannot be tried yet, which changes what they log but not what
+# budget_give_back does with them.
 BUDGET_SETTINGS="profile cpu_pl1 cpu_pl2 gpu"
 
 # Not back to the prior value: a raise is given back by dropping to
@@ -371,6 +373,8 @@ budget_give_back() {
   printf '%s\n' "$episode"
 }
 
+budget_latched() { [[ -n $(state_get latched) ]]; }
+
 budget_latch_at() {
   local t; t=$(state_get latched)
   [[ -n $t ]] && date -d "@$t" '+%Y-%m-%d %H:%M' 2>/dev/null
@@ -428,7 +432,7 @@ gate() {
       echo "lenovo-power: this raises a power budget."
       echo
       for row in "$@"; do
-        IFS='|' read -r label cur new <<<"$row"
+        IFS='|' read -r label cur new _ <<<"$row"
         printf '  %-18s %s  ->  %s\n' "$label" "$cur" "$new"
       done
       echo
@@ -490,7 +494,7 @@ cmd_status() {
   fi
   # Say so when the guard is holding the machine down, so a profile that will
   # not stick is never a mystery.
-  if [[ -n $(budget_latch_at) ]]; then
+  if budget_latched; then
     printf '  thermal guard      latched %s: gave back %s\n' \
       "$(budget_latch_at)" "$(budget_latch_gave)"
     printf '                     and stays here until you raise a budget again\n'
@@ -855,7 +859,7 @@ monitor_poll() {
     printf 'CPU %s °C  (alert %s °C, guard %s °C)\n' "$temp" "$ALERT_TEMP" "$GUARD_TEMP"
     [[ -n $margin ]] && printf 'dGPU %s °C of thermal margin  (alert at %s °C)\n' "$margin" "$GPU_MARGIN"
     printf 'the guard would: %s\n' "$(budget_plan)"
-    [[ -n $(budget_latch_at) ]] && printf 'guard: latched %s\n' "$(budget_latch_at)"
+    budget_latched && printf 'guard: latched %s\n' "$(budget_latch_at)"
   fi
   return 0
 }
