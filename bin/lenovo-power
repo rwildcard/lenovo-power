@@ -41,6 +41,7 @@ ASSUME_YES=0
 GATE_SATISFIED=0
 GATE_NOTE=
 GATE_PRIOR_LATCH=
+GATE_PRIOR_GAVE=
 
 # Thresholds. Compiled-in defaults, overridable by environment so the systemd
 # unit can tune them without this needing a config file parser. They sit above
@@ -313,7 +314,9 @@ gate() {
   # anything and must not leave the latch off.
   GATE_SATISFIED=1
   GATE_PRIOR_LATCH=$(state_get latched)
+  GATE_PRIOR_GAVE=$(state_get latched_gave)
   state_clear latched
+  state_clear latched_gave
   return 0
 }
 
@@ -326,6 +329,7 @@ raise_failed() {
   local key
   for key in "$@"; do state_clear "$key"; done
   state_set latched "$GATE_PRIOR_LATCH"
+  state_set latched_gave "$GATE_PRIOR_GAVE"
 }
 
 # ---------------------------------------------------------------- status
@@ -348,8 +352,9 @@ cmd_status() {
   # Say so when the guard is holding the machine down, so a profile that will
   # not stick is never a mystery.
   if [[ -n $(state_get latched) ]]; then
-    printf '  thermal guard      latched %s - it gave back a raised power budget and\n' "$(latched_at)"
-    printf '                     stays here until you raise one again\n'
+    printf '  thermal guard      latched %s: gave back %s\n' \
+      "$(latched_at)" "$(state_get latched_gave)"
+    printf '                     and stays here until you raise a budget again\n'
   fi
 
   echo
@@ -697,14 +702,16 @@ guard_act() { # <temp> <held-for>
   # heat, drop - which would flap the profile and fill the log. The user
   # re-enables deliberately, and the gate's hot refusal stops an immediate
   # re-entry.
+  local gave_list; gave_list=$(join_list ${gave[@]+"${gave[@]}"})
   state_set latched "$(epoch)"
+  state_set latched_gave "$gave_list"
 
   # The machine is by definition over the alert threshold too, and the guard's
   # notification is the one that explains what just happened. Count this as the
   # alert so the two do not arrive together.
   state_set alert_last "$(epoch)"
 
-  local body="${LOG_DETAIL}. Gave back: $(join_list ${gave[@]+"${gave[@]}"})."
+  local body="${LOG_DETAIL}. Gave back: ${gave_list}."
   body+=" It stays here until you raise it again."
   notify critical "Power budget given back" "$body"
   echo "guard: $body"

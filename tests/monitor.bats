@@ -363,3 +363,33 @@ setup() {
 
   [[ $output == *"nothing"* ]]
 }
+
+@test "status says what the guard reversed, not merely that it latched" {
+  export LENOVO_POWER_GUARD_SUSTAIN=0
+  run "$LENOVO_POWER" profile max-power --yes
+  run "$LENOVO_POWER" cpu-limit 135 --yes
+  fake_cpu_temp 101
+  run "$LENOVO_POWER" monitor once
+
+  fake_cpu_temp 55
+  run "$LENOVO_POWER" status
+
+  [[ $output == *latched* ]]
+  [[ $output == *"profile to performance"* ]]
+  [[ $output == *"PL1 to 55 W"* ]]
+}
+
+@test "a raise the hardware refuses leaves the latched summary intact too" {
+  export LENOVO_POWER_GUARD_SUSTAIN=0
+  run "$LENOVO_POWER" profile max-power --yes
+  fake_cpu_temp 101
+  run "$LENOVO_POWER" monitor once
+
+  fake_cpu_temp 55
+  chmod 444 "$LENOVO_POWER_SYSFS_ROOT/sys/firmware/acpi/platform_profile"
+  run "$LENOVO_POWER" profile max-power --yes
+  [ "$status" -ne 0 ]
+
+  run "$LENOVO_POWER" status
+  [[ $output == *"profile to performance"* ]]
+}
