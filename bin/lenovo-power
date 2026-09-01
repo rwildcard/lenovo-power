@@ -24,7 +24,12 @@ wr() {
   local path=$1 val=$2
   [[ -e $path ]] || { echo "  (unsupported on this machine: $path)" >&2; return 1; }
   if [[ -w $path ]]; then
-    printf '%s' "$val" >"$path" 2>/dev/null && return 0
+    # Writable but still refused means the driver rejected the value, not a
+    # permission problem - report what the kernel actually said.
+    local err
+    err=$({ printf '%s' "$val" >"$path"; } 2>&1) && return 0
+    echo "  $(basename "$path"): kernel rejected '$val'${err:+ (${err##*: })}" >&2
+    return 1
   fi
   if have sudo; then
     # Try a cached/passwordless sudo first so scripts and keybinds never hang.
@@ -150,10 +155,24 @@ cmd_profile() {
       powerprofilesctl set "$ppd" || die "powerprofilesctl set $ppd failed"
     fi
   else
-    wr $PROFILE "$want" || return 1
+    if ! wr $PROFILE "$want"; then
+      if [[ $want == custom ]]; then
+        echo "note: this firmware lists 'custom' in platform_profile_choices but rejects" >&2
+        echo "      writes to it (EINVAL). Custom mode appears to be reachable only from" >&2
+        echo "      the Fn+Q hardware key, not sysfs, so cpu-limit cannot be applied." >&2
+      fi
+      return 1
+    fi
     echo "note: '$want' is not a power-profiles-daemon profile; ppd still reports its own" >&2
     echo "      last-set profile and may override this on the next AC/battery change." >&2
   fi
+  # Setting max-power/custom writes sysfs behind ppd's back, so ppd's cached
+  # state can already equal the profile we now want - making its set a no-op
+  # that leaves the firmware where it was. Reconcile the two.
+  if [[ $(rd $PROFILE) != "$want" ]]; then
+    wr $PROFILE "$want" || return 1
+  fi
+
   echo "platform profile: $(rd $PROFILE)"
 }
 
