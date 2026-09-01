@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# lenovo-power - control Lenovo Legion power settings on Linux
+# Targets the upstream lenovo_wmi_* / ideapad_laptop sysfs interfaces.
+
+set -uo pipefail
+
+PROFILE=/sys/firmware/acpi/platform_profile
+PROFILE_CHOICES=/sys/firmware/acpi/platform_profile_choices
+VPC=$(echo /sys/bus/platform/devices/VPC2004:*[0-9] | cut -d' ' -f1)
+FWA=/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes
+PSTATE=/sys/devices/system/cpu/intel_pstate
+CPUDIR=/sys/devices/system/cpu
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lenovo-power"
+
+# ppd profile name <-> firmware platform_profile name
+ppd_to_fw() { case "$1" in power-saver) echo low-power;; *) echo "$1";; esac; }
+fw_to_ppd() { case "$1" in low-power) echo power-saver;; *) echo "$1";; esac; }
+
+die() { echo "lenovo-power: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Write to a root-owned sysfs file, escalating only when we must.
+wr() {
+  local path=$1 val=$2
+  [[ -e $path ]] || { echo "  (unsupported on this machine: $path)" >&2; return 1; }
+  if [[ -w $path ]]; then
+    printf '%s' "$val" >"$path" 2>/dev/null && return 0
+  fi
+  if have sudo; then
+    # Try a cached/passwordless sudo first so scripts and keybinds never hang.
+    printf '%s' "$val" | sudo -n tee "$path" >/dev/null 2>&1 && return 0
+    if [[ -t 0 || -t 1 || -t 2 ]]; then
+      printf '%s' "$val" | sudo tee "$path" >/dev/null && return 0
+    fi
+  fi
+  echo "  cannot write $path (run: lenovo-power install-perms)" >&2
+  return 1
+}
+
+rd() { [[ -r $1 ]] && cat "$1" 2>/dev/null; }
+
+# Runtime PM state of the first NVIDIA PCI function, without waking it.
+gpu_runtime_status() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ $(rd "$d/vendor") == 0x10de ]] || continue
+    [[ $(rd "$d/class") == 0x030000 ]] || continue
+    rd "$d/power/runtime_status"; return
+  done
+}
+
+onoff()   { [[ ${1:-} == 1 ]] && echo on || echo off; }
+to_bool() {
+  case "${1,,}" in
+    on|1|true|yes|enable|enabled) echo 1;;
+    off|0|false|no|disable|disabled) echo 0;;
+    *) die "expected on|off, got '${1}'";;
+  esac
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+  local prof choices cons usbc fnl pl1 pl2 epp turbo
+  prof=$(rd $PROFILE); choices=$(rd $PROFILE_CHOICES)
+  cons=$(rd $VPC/conservation_mode); usbc=$(rd $VPC/usb_charging); fnl=$(rd $VPC/fn_lock)
+  pl1=$(rd $FWA/ppt_pl1_spl/current_value); pl2=$(rd $FWA/ppt_pl2_sppt/current_value)
+  epp=$(rd $CPUDIR/cpu0/cpufreq/energy_performance_preference)
+  turbo=$(rd $PSTATE/no_turbo)
+
+  echo "Power profile"
+  printf '  platform profile   %s\n' "${prof:-n/a}"
+  printf '  available          %s\n' "${choices:-n/a}"
+  if have powerprofilesctl; then
+    printf '  power-profiles-d   %s\n' "$(powerprofilesctl get 2>/dev/null || echo n/a)"
+  fi
+
+  echo
+  echo "CPU"
+  printf '  EPP                %s\n' "${epp:-n/a}"
+  printf '  turbo              %s\n' "$([[ ${turbo:-1} == 0 ]] && echo on || echo off)"
+  printf '  PL1 sustained      %s W  (range %s-%s, default %s)\n' \
+    "${pl1:-n/a}" "$(rd $FWA/ppt_pl1_spl/min_value)" "$(rd $FWA/ppt_pl1_spl/max_value)" "$(rd $FWA/ppt_pl1_spl/default_value)"
+  printf '  PL2 burst          %s W  (range %s-%s, default %s)\n' \
+    "${pl2:-n/a}" "$(rd $FWA/ppt_pl2_sppt/min_value)" "$(rd $FWA/ppt_pl2_sppt/max_value)" "$(rd $FWA/ppt_pl2_sppt/default_value)"
+
+  if have nvidia-smi; then
+    echo
+    echo "dGPU"
+    local pmctl; pmctl=$(gpu_runtime_status)
+    if [[ $pmctl == suspended ]]; then
+      # Querying nvidia-smi resumes the card and burns ~10 W. Not worth it just
+      # to draw a status line, so report the good news and leave it asleep.
+      printf '  runtime pm         suspended (not queried - waking it costs power)\n'
+    else
+      nvidia-smi --query-gpu=name,power.draw,enforced.power.limit,power.min_limit,power.max_limit \
+        --format=csv,noheader,nounits 2>/dev/null | \
+        awk -F', ' '{printf "  %s\n  draw               %s W\n  limit              %s W  (range %s-%s)\n",$1,$2,$3,$4,$5}'
+      printf '  runtime pm         %s\n' "${pmctl:-n/a}"
+    fi
+  fi
+
+  echo
+  echo "Battery"
+  local cap st rate
+  cap=$(rd /sys/class/power_supply/BAT0/capacity); st=$(rd /sys/class/power_supply/BAT0/status)
+  rate=$(rd /sys/class/power_supply/BAT0/power_now)
+  printf '  charge             %s%% (%s)\n' "${cap:-?}" "${st:-?}"
+  [[ -n $rate ]] && printf '  draw               %.1f W\n' "$(awk -v u="$rate" 'BEGIN{print u/1000000}')"
+  printf '  conservation mode  %s  (caps charge ~60%% to preserve the cell)\n' "$(onoff "${cons:-}")"
+
+  echo
+  echo "Misc"
+  printf '  USB always-on      %s\n' "$(onoff "${usbc:-}")"
+  printf '  Fn lock            %s\n' "$(onoff "${fnl:-}")"
+  local f1 f2 h
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ $(rd "$h/name") == lenovo_wmi_other ]] || continue
+    f1=$(rd "$h/fan1_input"); f2=$(rd "$h/fan2_input"); break
+  done
+  [[ -n ${f1:-} ]] && printf '  fans               %s / %s rpm (read-only)\n' "$f1" "$f2"
+
+  # Nudge toward the one-time setup if the knobs still need root.
+  if [[ ! -w $PROFILE ]]; then
+    echo
+    echo "  Most settings still need sudo. Run 'lenovo-power install-perms' once"
+    echo "  to let your user change them directly."
+  fi
+}
+
+# ---------------------------------------------------------------- profile
+
+cmd_profile() {
+  local want=${1:-}
+  if [[ -z $want ]]; then rd $PROFILE; return; fi
+  local choices; choices=$(rd $PROFILE_CHOICES)
+  want=$(ppd_to_fw "$want")
+  [[ " $choices " == *" $want "* ]] || die "profile must be one of: $choices"
+
+  # Let power-profiles-daemon own the profiles it knows about, so its state
+  # (and the Omarchy shell menu) stays in sync. Fall back to raw sysfs for
+  # max-power / custom, which ppd does not expose.
+  local ppd; ppd=$(fw_to_ppd "$want")
+  if have powerprofilesctl && powerprofilesctl list 2>/dev/null | grep -q "^ *\*\? *${ppd}:"; then
+    # Prefer Omarchy's wrapper when present: it also records the choice per
+    # AC/battery state, so it survives a reboot and an unplug.
+    if have omarchy-powerprofiles-set; then
+      omarchy-powerprofiles-set autodetect "$ppd" || die "omarchy-powerprofiles-set $ppd failed"
+    else
+      powerprofilesctl set "$ppd" || die "powerprofilesctl set $ppd failed"
+    fi
+  else
+    wr $PROFILE "$want" || return 1
+    echo "note: '$want' is not a power-profiles-daemon profile; ppd still reports its own" >&2
+    echo "      last-set profile and may override this on the next AC/battery change." >&2
+  fi
+  echo "platform profile: $(rd $PROFILE)"
+}
+
+# ---------------------------------------------------------------- cpu
+
+cmd_epp() {
+  local want=${1:-}
+  if [[ -z $want ]]; then rd $CPUDIR/cpu0/cpufreq/energy_performance_preference; return; fi
+  local avail; avail=$(rd $CPUDIR/cpu0/cpufreq/energy_performance_available_preferences)
+  [[ " $avail " == *" $want "* ]] || die "epp must be one of: $avail"
+  local n=0
+  for f in $CPUDIR/cpu*/cpufreq/energy_performance_preference; do
+    wr "$f" "$want" >/dev/null 2>&1 && ((n++))
+  done
+  (( n > 0 )) || die "could not set EPP (run: lenovo-power install-perms)"
+  echo "EPP set to $want on $n cpus"
+}
+
+cmd_turbo() {
+  local want=${1:-}
+  if [[ -z $want ]]; then [[ $(rd $PSTATE/no_turbo) == 0 ]] && echo on || echo off; return; fi
+  # no_turbo is inverted
+  local b; b=$(to_bool "$want")
+  wr $PSTATE/no_turbo "$(( 1 - b ))" || return 1
+  echo "turbo: $([[ $(rd $PSTATE/no_turbo) == 0 ]] && echo on || echo off)"
+}
+
+cmd_cpu_limit() {
+  local pl1=${1:-} pl2=${2:-}
+  if [[ -z $pl1 ]]; then
+    printf 'PL1 %s W / PL2 %s W\n' "$(rd $FWA/ppt_pl1_spl/current_value)" "$(rd $FWA/ppt_pl2_sppt/current_value)"
+    return
+  fi
+  [[ $(rd $PROFILE) == custom ]] || {
+    echo "note: CPU power limits are only honoured in the 'custom' platform profile." >&2
+    echo "      run: lenovo-power profile custom" >&2
+  }
+  local lo hi
+  lo=$(rd $FWA/ppt_pl1_spl/min_value); hi=$(rd $FWA/ppt_pl1_spl/max_value)
+  (( pl1 >= lo && pl1 <= hi )) || die "PL1 must be ${lo}-${hi} W"
+  wr $FWA/ppt_pl1_spl/current_value "$pl1" || return 1
+  if [[ -n $pl2 ]]; then
+    lo=$(rd $FWA/ppt_pl2_sppt/min_value); hi=$(rd $FWA/ppt_pl2_sppt/max_value)
+    (( pl2 >= lo && pl2 <= hi )) || die "PL2 must be ${lo}-${hi} W"
+    wr $FWA/ppt_pl2_sppt/current_value "$pl2" || return 1
+  fi
+  cmd_cpu_limit
+}
+
+# ---------------------------------------------------------------- gpu
+
+cmd_gpu_limit() {
+  have nvidia-smi || die "nvidia-smi not installed"
+  local want=${1:-}
+  if [[ -z $want ]]; then
+    nvidia-smi --query-gpu=enforced.power.limit,power.min_limit,power.max_limit \
+      --format=csv,noheader,nounits | awk -F', ' '{printf "%s W (range %s-%s)\n",$1,$2,$3}'
+    return
+  fi
+  sudo nvidia-smi -pl "$want" >/dev/null || die "failed to set GPU power limit"
+  cmd_gpu_limit
+}
+
+# ---------------------------------------------------------------- toggles
+
+cmd_toggle() { # <label> <path> <arg>
+  local label=$1 path=$2 arg=${3:-}
+  if [[ -z $arg ]]; then onoff "$(rd "$path")"; return; fi
+  wr "$path" "$(to_bool "$arg")" || return 1
+  printf '%s: %s\n' "$label" "$(onoff "$(rd "$path")")"
+}
+
+# ---------------------------------------------------------------- presets
+
+cmd_preset() {
+  local p=${1:-}
+  case "$p" in
+    quiet)   cmd_profile low-power;   cmd_epp power;                cmd_turbo off ;;
+    travel)  cmd_profile low-power;   cmd_epp balance_power;        cmd_turbo on  ;;
+    work)    cmd_profile balanced;    cmd_epp balance_performance;  cmd_turbo on  ;;
+    game)    cmd_profile performance; cmd_epp performance;          cmd_turbo on  ;;
+    max)     cmd_profile max-power;   cmd_epp performance;          cmd_turbo on  ;;
+    "")      [[ -r $STATE_DIR/preset ]] && cat "$STATE_DIR/preset" || echo "(none set)"; return ;;
+    *) die "preset must be one of: quiet travel work game max" ;;
+  esac
+  mkdir -p "$STATE_DIR" && echo "$p" >"$STATE_DIR/preset"
+}
+
+# ---------------------------------------------------------------- perms
+
+cmd_install_perms() {
+  local installer="$HOME/.local/share/lenovo-power/install-perms.sh"
+  [[ -x $installer ]] || die "installer missing: $installer"
+  echo "This grants group 'wheel' write access to the Lenovo power sysfs knobs,"
+  echo "so lenovo-power no longer needs sudo. Requires your password."
+  echo
+  sudo "$installer"
+}
+
+usage() {
+  cat <<'USAGE'
+lenovo-power - control Lenovo Legion power settings
+
+  status                        show everything (default)
+  profile [NAME]                low-power | balanced | performance | max-power | custom
+  preset [NAME]                 quiet | travel | work | game | max
+  epp [PREF]                    power | balance_power | balance_performance | performance | default
+  turbo [on|off]                intel_pstate turbo boost
+  cpu-limit [PL1 [PL2]]         CPU sustained / burst watts (needs 'custom' profile)
+  gpu-limit [WATTS]             NVIDIA dGPU power cap (needs sudo)
+  battery-cap [on|off]          conservation mode - hold charge at ~60%
+  usb-charging [on|off]         charge USB devices while the lid is shut
+  fn-lock [on|off]              Fn key lock
+  install-perms                 allow the wheel group to write these knobs (no more sudo)
+
+Reading a setting: omit the argument.
+USAGE
+}
+
+case "${1:-status}" in
+  status|"")      cmd_status ;;
+  profile)        cmd_profile "${2:-}" ;;
+  preset)         cmd_preset "${2:-}" ;;
+  epp)            cmd_epp "${2:-}" ;;
+  turbo)          cmd_turbo "${2:-}" ;;
+  cpu-limit)      cmd_cpu_limit "${2:-}" "${3:-}" ;;
+  gpu-limit)      cmd_gpu_limit "${2:-}" ;;
+  battery-cap)    cmd_toggle "conservation mode" $VPC/conservation_mode "${2:-}" ;;
+  usb-charging)   cmd_toggle "USB always-on" $VPC/usb_charging "${2:-}" ;;
+  fn-lock)        cmd_toggle "Fn lock" $VPC/fn_lock "${2:-}" ;;
+  install-perms)  cmd_install_perms ;;
+  -h|--help|help) usage ;;
+  *)              usage; exit 1 ;;
+esac

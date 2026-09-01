@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""lenovo-power-gui - a small live status panel for Lenovo Legion laptops.
+
+Reads the same sysfs interfaces as the lenovo-power CLI. Read-only: it never
+changes a setting, and it never wakes a suspended dGPU just to draw a row.
+"""
+
+import os
+import glob
+import subprocess
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
+
+REFRESH_SECONDS = 2
+
+PROFILE = "/sys/firmware/acpi/platform_profile"
+CPUDIR = "/sys/devices/system/cpu"
+FWA = "/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes"
+BAT = "/sys/class/power_supply/BAT0"
+
+
+# --------------------------------------------------------------- sysfs helpers
+
+def rd(path, default=""):
+    """Read a sysfs file, returning `default` if it is missing or unreadable."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def rd_int(path, default=None):
+    try:
+        return int(rd(path))
+    except ValueError:
+        return default
+
+
+def first_glob(pattern):
+    hits = sorted(glob.glob(pattern))
+    return hits[0] if hits else None
+
+
+def hwmon_by_name(name):
+    for path in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if rd(os.path.join(path, "name")) == name:
+            return path
+    return None
+
+
+VPC = first_glob("/sys/bus/platform/devices/VPC2004:*") or ""
+HW_LENOVO = hwmon_by_name("lenovo_wmi_other")
+HW_CORETEMP = hwmon_by_name("coretemp")
+
+
+def onoff(value):
+    return "On" if value == "1" else "Off"
+
+
+def nvidia_pci():
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        if rd(os.path.join(dev, "vendor")) == "0x10de" and rd(os.path.join(dev, "class")) == "0x030000":
+            return dev
+    return None
+
+
+NVIDIA = nvidia_pci()
+
+
+# --------------------------------------------------------------- dGPU polling
+
+class GpuPoller:
+    """Polls nvidia-smi on a worker thread, but only while the card is awake.
+
+    Querying nvidia-smi resumes a runtime-suspended dGPU and costs ~10 W, which
+    would defeat the point of a power panel, so a suspended card is left alone.
+    """
+
+    def __init__(self):
+        self.data = {}
+        self.state = "unknown"
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        thread = threading.Thread(target=self._loop, daemon=True)
+        thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            state = rd(os.path.join(NVIDIA, "power/runtime_status")) if NVIDIA else ""
+            data = {}
+            if state == "active":
+                try:
+                    out = subprocess.run(
+                        ["nvidia-smi",
+                         "--query-gpu=name,power.draw,enforced.power.limit,"
+                         "temperature.gpu,utilization.gpu,clocks.sm",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                    if out:
+                        parts = [p.strip() for p in out.split(",")]
+                        keys = ["name", "draw", "limit", "temp", "util", "clock"]
+                        data = dict(zip(keys, parts))
+                except (OSError, subprocess.SubprocessError):
+                    data = {}
+            with self._lock:
+                self.state = state
+                self.data = data
+            self._stop.wait(REFRESH_SECONDS)
+
+    def snapshot(self):
+        with self._lock:
+            return self.state, dict(self.data)
+
+
+# --------------------------------------------------------------- static specs
+
+def static_specs():
+    cpu_model = ""
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+
+    threads = os.cpu_count() or 0
+    max_khz = rd_int(f"{CPUDIR}/cpu0/cpufreq/cpuinfo_max_freq")
+    cpu = cpu_model
+    if threads:
+        cpu += f"  ·  {threads} threads"
+    if max_khz:
+        cpu += f"  ·  up to {max_khz / 1_000_000:.1f} GHz"
+
+    mem_kb = 0
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal"):
+                    mem_kb = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+
+    dgpu = "-"
+    if NVIDIA:
+        # Read the PCI id from sysfs rather than nvidia-smi so a sleeping card
+        # stays asleep; fall back to a raw id if lspci is unavailable.
+        try:
+            ids = subprocess.run(["lspci", "-s", os.path.basename(NVIDIA), "-nn"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            dgpu = ids.split(":", 2)[-1].split("[")[0].strip() if ids else "NVIDIA dGPU"
+        except (OSError, subprocess.SubprocessError):
+            dgpu = "NVIDIA dGPU"
+
+    disks = []
+    for dev in sorted(glob.glob("/sys/block/nvme*n1")) + sorted(glob.glob("/sys/block/sd?")):
+        name = os.path.basename(dev)
+        sectors = rd_int(os.path.join(dev, "size"), 0) or 0
+        model = rd(os.path.join(dev, "device/model")) or rd(os.path.join(dev, "device/name"))
+        disks.append(f"{name} {sectors * 512 / 1e9:.0f} GB {model}".strip())
+
+    vendor = rd("/sys/class/dmi/id/sys_vendor")
+    version = rd("/sys/class/dmi/id/product_version")
+    product = rd("/sys/class/dmi/id/product_name")
+
+    return [
+        ("Model", f"{vendor} {version}".strip() or product),
+        ("Board", f"{product}  ·  BIOS {rd('/sys/class/dmi/id/bios_version')}"),
+        ("CPU", cpu),
+        ("Graphics", dgpu),
+        ("Memory", f"{mem_kb / 1024 / 1024:.0f} GiB" if mem_kb else "-"),
+        ("Storage", "\n".join(disks) if disks else "-"),
+        ("Kernel", os.uname().release),
+    ]
+
+
+# --------------------------------------------------------------- window
+
+class Row(Adw.ActionRow):
+    """A label on the left, a live value on the right."""
+
+    def __init__(self, title):
+        super().__init__(title=title)
+        self.value = Gtk.Label(xalign=1)
+        self.value.add_css_class("dim-label")
+        self.value.add_css_class("numeric")
+        self.value.set_selectable(True)
+        # Values are short; wrapping only ever splits "70" from "W".
+        self.value.set_wrap(False)
+        self.value.set_ellipsize(Pango.EllipsizeMode.END)
+        self.add_suffix(self.value)
+
+    def set(self, text):
+        self.value.set_text(str(text))
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Lenovo Power")
+        self.set_default_size(460, 720)
+        self.gpu = GpuPoller()
+
+        header = Adw.HeaderBar()
+        page = Adw.PreferencesPage()
+
+        self.rows = {}
+
+        def group(title, keys, description=None):
+            grp = Adw.PreferencesGroup(title=title)
+            if description:
+                grp.set_description(description)
+            for key in keys:
+                row = Row(key)
+                self.rows[f"{title}/{key}"] = row
+                grp.add(row)
+            page.add(grp)
+
+        group("Power", ["Platform profile", "Daemon profile", "EPP", "Turbo boost",
+                        "CPU sustained (PL1)", "CPU burst (PL2)"])
+        group("CPU", ["Frequency", "Temperature", "Load average"])
+        group("Graphics", ["dGPU state", "dGPU power", "dGPU temperature", "dGPU utilisation"])
+        group("Battery", ["Charge", "State", "Draw", "Conservation mode"])
+        group("Cooling", ["Fan 1", "Fan 2", "NVMe"])
+
+        specs = Adw.PreferencesGroup(title="Specifications")
+        for title, value in static_specs():
+            row = Adw.ActionRow(title=title, subtitle=value)
+            row.set_subtitle_selectable(True)
+            specs.add(row)
+        page.add(specs)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.set_child(page)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(scroller)
+        self.set_content(view)
+
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+
+    def put(self, group_name, key, value):
+        self.rows[f"{group_name}/{key}"].set(value)
+
+    def refresh(self):
+        # ---- Power
+        self.put("Power", "Platform profile", rd(PROFILE, "-"))
+        self.put("Power", "Daemon profile", self.ppd_profile())
+        self.put("Power", "EPP", rd(f"{CPUDIR}/cpu0/cpufreq/energy_performance_preference", "-"))
+        no_turbo = rd(f"{CPUDIR}/intel_pstate/no_turbo")
+        self.put("Power", "Turbo boost", "On" if no_turbo == "0" else "Off" if no_turbo else "-")
+        pl1 = rd(f"{FWA}/ppt_pl1_spl/current_value")
+        pl2 = rd(f"{FWA}/ppt_pl2_sppt/current_value")
+        self.put("Power", "CPU sustained (PL1)", f"{pl1} W" if pl1 else "-")
+        self.put("Power", "CPU burst (PL2)", f"{pl2} W" if pl2 else "-")
+
+        # ---- CPU
+        freqs = []
+        for path in glob.glob(f"{CPUDIR}/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+            value = rd_int(path)
+            if value:
+                freqs.append(value)
+        if freqs:
+            self.put("CPU", "Frequency",
+                     f"{sum(freqs) / len(freqs) / 1e6:.2f} GHz avg  ·  {max(freqs) / 1e6:.2f} peak")
+        else:
+            self.put("CPU", "Frequency", "-")
+
+        temp = self.package_temp()
+        self.put("CPU", "Temperature", f"{temp:.0f} °C" if temp else "-")
+        try:
+            with open("/proc/loadavg") as fh:
+                self.put("CPU", "Load average", " ".join(fh.read().split()[:3]))
+        except OSError:
+            self.put("CPU", "Load average", "-")
+
+        # ---- Graphics
+        state, gpu = self.gpu.snapshot()
+        if state == "suspended":
+            self.put("Graphics", "dGPU state", "Suspended (idle)")
+            for key in ("dGPU power", "dGPU temperature", "dGPU utilisation"):
+                self.put("Graphics", key, "asleep")
+        elif state == "active" and gpu:
+            self.put("Graphics", "dGPU state", "Active")
+            self.put("Graphics", "dGPU power", f"{gpu.get('draw', '-')} / {gpu.get('limit', '-')} W")
+            self.put("Graphics", "dGPU temperature", f"{gpu.get('temp', '-')} °C")
+            self.put("Graphics", "dGPU utilisation",
+                     f"{gpu.get('util', '-')} %  ·  {gpu.get('clock', '-')} MHz")
+        else:
+            self.put("Graphics", "dGPU state", state or "-")
+            for key in ("dGPU power", "dGPU temperature", "dGPU utilisation"):
+                self.put("Graphics", key, "-")
+
+        # ---- Battery
+        capacity = rd(f"{BAT}/capacity")
+        self.put("Battery", "Charge", f"{capacity} %" if capacity else "-")
+        self.put("Battery", "State", rd(f"{BAT}/status", "-"))
+        power_uw = rd_int(f"{BAT}/power_now")
+        self.put("Battery", "Draw", f"{power_uw / 1e6:.1f} W" if power_uw is not None else "-")
+        self.put("Battery", "Conservation mode", onoff(rd(f"{VPC}/conservation_mode")) if VPC else "-")
+
+        # ---- Cooling
+        if HW_LENOVO:
+            for index, key in ((1, "Fan 1"), (2, "Fan 2")):
+                rpm = rd(f"{HW_LENOVO}/fan{index}_input")
+                self.put("Cooling", key, f"{rpm} rpm" if rpm else "-")
+        else:
+            self.put("Cooling", "Fan 1", "-")
+            self.put("Cooling", "Fan 2", "-")
+
+        nvme = []
+        for path in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            if rd(os.path.join(path, "name")) == "nvme":
+                value = rd_int(os.path.join(path, "temp1_input"))
+                if value:
+                    nvme.append(f"{value / 1000:.0f} °C")
+        self.put("Cooling", "NVMe", "  ·  ".join(nvme) if nvme else "-")
+
+        return GLib.SOURCE_CONTINUE
+
+    def package_temp(self):
+        """Prefer the CPU package sensor, else the hottest core."""
+        if not HW_CORETEMP:
+            return None
+        hottest = None
+        for label_path in glob.glob(f"{HW_CORETEMP}/temp*_label"):
+            value = rd_int(label_path.replace("_label", "_input"))
+            if value is None:
+                continue
+            if "Package" in rd(label_path):
+                return value / 1000
+            hottest = value if hottest is None else max(hottest, value)
+        return hottest / 1000 if hottest else None
+
+    def ppd_profile(self):
+        try:
+            return subprocess.run(["powerprofilesctl", "get"], capture_output=True,
+                                  text=True, timeout=3).stdout.strip() or "-"
+        except (OSError, subprocess.SubprocessError):
+            return "-"
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.local.LenovoPower")
+
+    def do_activate(self):
+        window = self.props.active_window or Window(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    App().run(None)
