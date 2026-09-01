@@ -19,6 +19,47 @@ HWMON=$SYS/class/hwmon
 PCIDIR=$SYS/bus/pci/devices
 BAT=$SYS/class/power_supply/BAT0
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lenovo-power"
+STATE_FILE=$STATE_DIR/state
+LOG_FILE=$STATE_DIR/log.jsonl
+
+# Who is making the change, as recorded in the log: user, preset or guard, and
+# the context to attach to whatever is logged next. The guard sets the detail so
+# that the temperature which triggered it lands on every entry it causes, even
+# the ones written by commands that know nothing about the guard.
+ACTOR=user
+LOG_DETAIL=
+
+# A rolling ceiling on the log. Trimming back well under the ceiling amortises
+# the rewrite across the appends in between, rather than rewriting on every
+# append once the file is full. Policy, not a tunable: no environment override.
+LOG_MAX=5000
+LOG_KEEP=4000
+
+# Set by --yes, and by the gate once it has been satisfied for this run, so a
+# preset that asks once up front does not ask again for each setting it writes.
+ASSUME_YES=0
+GATE_SATISFIED=0
+GATE_NOTE=
+GATE_PRIOR_LATCH=
+
+# Thresholds. Compiled-in defaults, overridable by environment so the systemd
+# unit can tune them without this needing a config file parser. They sit above
+# ordinary load and below the firmware's first fan stage at 103 C, so the alert
+# always precedes the guard and both precede the firmware's thermal ladder.
+ALERT_TEMP=${LENOVO_POWER_ALERT_TEMP:-95}
+ALERT_SUSTAIN=${LENOVO_POWER_ALERT_SUSTAIN:-30}
+ALERT_REPEAT=${LENOVO_POWER_ALERT_REPEAT:-600}
+GUARD_TEMP=${LENOVO_POWER_GUARD_TEMP:-100}
+GUARD_SUSTAIN=${LENOVO_POWER_GUARD_SUSTAIN:-60}
+GPU_MARGIN=${LENOVO_POWER_GPU_MARGIN:-5}
+POLL_INTERVAL=${LENOVO_POWER_POLL_INTERVAL:-10}
+
+# The armed set: the platform profiles that raise a power budget. Together with
+# cpu-limit and gpu-limit these are exactly the commands that both ask for
+# confirmation and arm the thermal guard - one list serving both purposes, so a
+# future power-raising command wires up both and neither can be forgotten.
+RAISING_PROFILES="max-power custom"
+raises_power() { [[ " $RAISING_PROFILES " == *" ${1} "* ]]; }
 
 # ppd profile name <-> firmware platform_profile name
 ppd_to_fw() { case "$1" in power-saver) echo low-power;; *) echo "$1";; esac; }
@@ -26,6 +67,13 @@ fw_to_ppd() { case "$1" in low-power) echo power-saver;; *) echo "$1";; esac; }
 
 die() { echo "lenovo-power: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# A typo in a unit's Environment= line would otherwise be read as zero, and a
+# threshold of zero means "always triggered". Refuse to start instead.
+for _t in ALERT_TEMP ALERT_SUSTAIN ALERT_REPEAT GUARD_TEMP GUARD_SUSTAIN GPU_MARGIN POLL_INTERVAL; do
+  [[ ${!_t} =~ ^[0-9]+$ ]] || die "LENOVO_POWER_${_t} must be a whole number, got '${!_t}'"
+done
+unset _t
 
 # Write to a root-owned sysfs file, escalating only when we must.
 wr() {
@@ -53,6 +101,85 @@ wr() {
 }
 
 rd() { [[ -r $1 ]] && cat "$1" 2>/dev/null; }
+
+# ------------------------------------------------------- state and transaction log
+#
+# Two files, deliberately apart. The state file is small and rewritten in place;
+# it holds what the guard needs to know - what was raised, from what, and
+# whether it has already acted. The log only ever grows, and is never rewritten
+# except to trim.
+
+# One key per TAB-separated line. Values come from a controlled vocabulary
+# (profile names, integers, epoch seconds), so no quoting is needed.
+state_get() {
+  local k v
+  [[ -r $STATE_FILE ]] || return 0
+  while IFS=$'\t' read -r k v; do
+    [[ $k == "$1" ]] && { printf '%s\n' "$v"; return 0; }
+  done <"$STATE_FILE"
+  return 0
+}
+
+# Setting a key to the empty string removes it, which is how a key is cleared.
+# A write that would change nothing is skipped, so the monitor's loop does not
+# rewrite the file on every poll of an idle machine.
+state_set() {
+  local tmp
+  [[ $(state_get "$1") == "${2:-}" ]] && return 0
+  mkdir -p "$STATE_DIR" || return 1
+  tmp=$STATE_FILE.$$
+  {
+    if [[ -r $STATE_FILE ]]; then awk -F'\t' -v k="$1" '$1 != k' "$STATE_FILE"; fi
+    if [[ -n ${2:-} ]]; then printf '%s\t%s\n' "$1" "$2"; fi
+  } >"$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+state_clear() { state_set "$1" ""; }
+
+# Append one event: <actor> <setting> <from> <to> <outcome> [detail].
+#
+# JSONL rather than columns because the raw file's only readers are machines -
+# 'history' renders it for humans - and because name-keyed assertions survive a
+# new field where positional ones would not. Generating JSON from shell is
+# normally an escaping hazard; here every value is a profile name, an integer,
+# an ISO timestamp or a fixed outcome word, none of which can contain a quote,
+# a tab or a newline. Revisit this if a free-text field is ever added.
+#
+# The CLI and the monitor are separate processes appending to the same file. One
+# compact line per event stays well under the atomic-append size, so their
+# writes can never interleave.
+log_event() {
+  local line detail=${6:-$LOG_DETAIL}
+  mkdir -p "$STATE_DIR" || return 0
+  printf -v line '{"ts":"%s","actor":"%s","setting":"%s","from":"%s","to":"%s","outcome":"%s"' \
+    "$(date -Is)" "$1" "$2" "${3:--}" "${4:--}" "$5"
+  [[ -n $detail ]] && printf -v line '%s,"detail":"%s"' "$line" "$detail"
+  printf '%s}\n' "$line" >>"$LOG_FILE"
+  log_trim
+}
+
+log_trim() {
+  local n tmp
+  n=$(wc -l <"$LOG_FILE" 2>/dev/null) || return 0
+  (( n >= LOG_MAX )) || return 0
+  tmp=$LOG_FILE.$$
+  tail -n "$LOG_KEEP" "$LOG_FILE" >"$tmp" && mv -f "$tmp" "$LOG_FILE"
+}
+
+# Log a write and pass its success or failure through, so callers can write
+#   wr_logged <setting> <path> <from> <to> [raw] || return 1
+# and get both the write and its record in one step. RAW is the value actually
+# written when it differs from the one worth logging, as for the 0/1 toggles
+# that read back as on/off.
+wr_logged() {
+  local setting=$1 path=$2 from=$3 to=$4 raw=${5:-$4}
+  if wr "$path" "$raw"; then
+    log_event "$ACTOR" "$setting" "$from" "$to" applied
+    return 0
+  fi
+  log_event "$ACTOR" "$setting" "$from" "$to" failed
+  return 1
+}
 
 # Runtime PM state of the first NVIDIA PCI function, without waking it.
 gpu_runtime_status() {
@@ -86,6 +213,21 @@ cpu_temp() {
   done
 }
 
+# The dGPU's enforced power cap in watts, and the default the card ships with.
+# Both go through nvidia-smi, so callers must check the card is awake first.
+gpu_power_limit()   { nvidia-smi --query-gpu=enforced.power.limit --format=csv,noheader,nounits 2>/dev/null; }
+gpu_default_limit() { nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits 2>/dev/null; }
+
+# Join arguments into a readable list, with a word for the empty case.
+join_list() {
+  local out
+  (( $# )) || return 0
+  printf -v out '%s, ' "$@"
+  echo "${out%, }"
+}
+
+turbo_state() { [[ $(rd $PSTATE/no_turbo) == 0 ]] && echo on || echo off; }
+
 onoff()   { [[ ${1:-} == 1 ]] && echo on || echo off; }
 to_bool() {
   case "${1,,}" in
@@ -93,6 +235,97 @@ to_bool() {
     off|0|false|no|disable|disabled) echo 0;;
     *) die "expected on|off, got '${1}'";;
   esac
+}
+
+# ------------------------------------------------------------------- the gate
+#
+# Confirmation is the moment the tool explains itself, so the prompt names the
+# setting, what it is now and what it would become, and says what the change is
+# and is not.
+#
+# gate <setting> <row>... where each row is "label|current|new".
+gate() {
+  local setting=$1; shift
+
+  # A refusal is worth as much in the log as a success, so it records what was
+  # being asked for and not merely that something was declined. The first row is
+  # the headline change; the rest, if any, come with it.
+  local gfrom=- gto=-
+  (( $# )) && IFS='|' read -r _ gfrom gto <<<"$1"
+
+  # A CPU already in the guard's territory refuses the raise outright, and
+  # --yes deliberately does not override this one: a scripting convenience must
+  # not punch through a thermal guard, or a raise could walk straight back into
+  # the state the guard just pulled the machine out of.
+  local temp; temp=$(cpu_temp)
+  if [[ -n $temp ]] && (( temp >= GUARD_TEMP )); then
+    log_event "$ACTOR" "$setting" "$gfrom" "$gto" refused \
+      "CPU at ${temp} C, at or above the ${GUARD_TEMP} C guard trigger"
+    echo "lenovo-power: refusing to raise $setting - the CPU is at ${temp} °C, at or above" >&2
+    echo "  the ${GUARD_TEMP} °C thermal guard trigger. Let it cool first." >&2
+    echo "  (--yes does not override this.)" >&2
+    return 1
+  fi
+
+  if (( ! GATE_SATISFIED && ! ASSUME_YES )); then
+    # Fail closed. Launched from a keybinding or a service there is nowhere to
+    # prompt, and a gate that opens itself when nobody is watching is not a gate.
+    if [[ ! -t 0 ]]; then
+      log_event "$ACTOR" "$setting" "$gfrom" "$gto" refused "no terminal to confirm on"
+      echo "lenovo-power: refusing to raise $setting with no terminal to confirm on." >&2
+      echo "  Run it from a terminal, or pass --yes if you meant this from a script." >&2
+      return 1
+    fi
+
+    local row label cur new reply
+    {
+      echo
+      echo "lenovo-power: this raises a power budget."
+      echo
+      for row in "$@"; do
+        IFS='|' read -r label cur new <<<"$row"
+        printf '  %-18s %s  ->  %s\n' "$label" "$cur" "$new"
+      done
+      echo
+      [[ -n $GATE_NOTE ]] && { echo "  $GATE_NOTE"; echo; }
+      echo "  This changes how many watts the hardware may draw, at stock clocks. It is"
+      echo "  not overclocking: no clock multiplier and no voltage is touched, and the"
+      echo "  firmware's thermal ladder still applies and cannot be disabled."
+      echo
+      echo "  The thermal guard gives this back if the CPU stays at or above ${GUARD_TEMP} °C"
+      echo "  for ${GUARD_SUSTAIN}s."
+      echo
+    } >&2
+    read -r -p "  Apply? [y/N] " reply
+    echo >&2
+    case "${reply,,}" in
+      y|yes) ;;
+      *)
+        log_event "$ACTOR" "$setting" "$gfrom" "$gto" refused "declined at the prompt"
+        echo "lenovo-power: cancelled." >&2
+        return 1 ;;
+    esac
+  fi
+
+  # Getting here is the deliberate re-enable the guard waits for, so the latch
+  # comes off: the user has just been shown the state and chosen it. The old
+  # value is kept, because a raise that then fails to write has not re-enabled
+  # anything and must not leave the latch off.
+  GATE_SATISFIED=1
+  GATE_PRIOR_LATCH=$(state_get latched)
+  state_clear latched
+  return 0
+}
+
+# A raise that did not land must not leave the guard believing it did: give up
+# the values armed for it and put the latch back as the gate found it. Without
+# this, a refused write - `profile custom` returns EINVAL on this firmware -
+# would later have the guard "give back" a raise that never happened, moving the
+# machine up to performance rather than down.
+raise_failed() {
+  local key
+  for key in "$@"; do state_clear "$key"; done
+  state_set latched "$GATE_PRIOR_LATCH"
 }
 
 # ---------------------------------------------------------------- status
@@ -112,12 +345,18 @@ cmd_status() {
   if have powerprofilesctl; then
     printf '  power-profiles-d   %s\n' "$(powerprofilesctl get 2>/dev/null || echo n/a)"
   fi
+  # Say so when the guard is holding the machine down, so a profile that will
+  # not stick is never a mystery.
+  if [[ -n $(state_get latched) ]]; then
+    printf '  thermal guard      latched %s - it gave back a raised power budget and\n' "$(latched_at)"
+    printf '                     stays here until you raise one again\n'
+  fi
 
   echo
   echo "CPU"
   printf '  temperature        %s\n' "${temp:-n/a}"
   printf '  EPP                %s\n' "${epp:-n/a}"
-  printf '  turbo              %s\n' "$([[ ${turbo:-1} == 0 ]] && echo on || echo off)"
+  printf '  turbo              %s\n' "$(turbo_state)"
   printf '  PL1 sustained      %s W  (range %s-%s, default %s)\n' \
     "${pl1:-n/a}" "$(rd $FWA/ppt_pl1_spl/min_value)" "$(rd $FWA/ppt_pl1_spl/max_value)" "$(rd $FWA/ppt_pl1_spl/default_value)"
   printf '  PL2 burst          %s W  (range %s-%s, default %s)\n' \
@@ -175,20 +414,40 @@ cmd_profile() {
   want=$(ppd_to_fw "$want")
   [[ " $choices " == *" $want "* ]] || die "profile must be one of: $choices"
 
+  # One logical change reached by three routes - the daemon, a raw sysfs write,
+  # or the reconcile below - so this logs once at the end rather than through
+  # wr_logged, which pairs a single write with a single record.
+  #
   # Let power-profiles-daemon own the profiles it knows about, so its state
   # (and the Omarchy shell menu) stays in sync. Fall back to raw sysfs for
   # max-power / custom, which ppd does not expose.
+  local from armed_here=0
+  from=$(rd $PROFILE)
+  if raises_power "$want"; then
+    gate profile "platform profile|$from|$want" || return 1
+    # Recorded before the write, because the guard cannot give back what nobody
+    # wrote down - and given up again below if the write does not land.
+    state_set armed_profile "$from"; armed_here=1
+  fi
   local ppd; ppd=$(fw_to_ppd "$want")
   if have powerprofilesctl && powerprofilesctl list 2>/dev/null | grep -q "^ *\*\? *${ppd}:"; then
     # Prefer Omarchy's wrapper when present: it also records the choice per
     # AC/battery state, so it survives a reboot and an unplug.
     if have omarchy-powerprofiles-set; then
-      omarchy-powerprofiles-set autodetect "$ppd" || die "omarchy-powerprofiles-set $ppd failed"
+      omarchy-powerprofiles-set autodetect "$ppd" || {
+        (( armed_here )) && raise_failed armed_profile
+        log_event "$ACTOR" profile "$from" "$want" failed "omarchy-powerprofiles-set failed"
+        die "omarchy-powerprofiles-set $ppd failed"; }
     else
-      powerprofilesctl set "$ppd" || die "powerprofilesctl set $ppd failed"
+      powerprofilesctl set "$ppd" || {
+        (( armed_here )) && raise_failed armed_profile
+        log_event "$ACTOR" profile "$from" "$want" failed "powerprofilesctl failed"
+        die "powerprofilesctl set $ppd failed"; }
     fi
   else
     if ! wr $PROFILE "$want"; then
+      (( armed_here )) && raise_failed armed_profile
+      log_event "$ACTOR" profile "$from" "$want" failed
       if [[ $want == custom ]]; then
         echo "note: this firmware lists 'custom' in platform_profile_choices but rejects" >&2
         echo "      writes to it (EINVAL). Custom mode appears to be reachable only from" >&2
@@ -203,9 +462,14 @@ cmd_profile() {
   # state can already equal the profile we now want - making its set a no-op
   # that leaves the firmware where it was. Reconcile the two.
   if [[ $(rd $PROFILE) != "$want" ]]; then
-    wr $PROFILE "$want" || return 1
+    if ! wr $PROFILE "$want"; then
+      (( armed_here )) && raise_failed armed_profile
+      log_event "$ACTOR" profile "$from" "$want" failed
+      return 1
+    fi
   fi
 
+  log_event "$ACTOR" profile "$from" "$want" applied
   echo "platform profile: $(rd $PROFILE)"
 }
 
@@ -216,21 +480,29 @@ cmd_epp() {
   if [[ -z $want ]]; then rd $CPUDIR/cpu0/cpufreq/energy_performance_preference; return; fi
   local avail; avail=$(rd $CPUDIR/cpu0/cpufreq/energy_performance_available_preferences)
   [[ " $avail " == *" $want "* ]] || die "epp must be one of: $avail"
+  local from; from=$(rd $CPUDIR/cpu0/cpufreq/energy_performance_preference)
   local n=0
   for f in $CPUDIR/cpu*/cpufreq/energy_performance_preference; do
     wr "$f" "$want" >/dev/null 2>&1 && ((n++))
   done
-  (( n > 0 )) || die "could not set EPP (run: lenovo-power install-perms)"
+  if (( n == 0 )); then
+    log_event "$ACTOR" epp "$from" "$want" failed
+    die "could not set EPP (run: lenovo-power install-perms)"
+  fi
+  log_event "$ACTOR" epp "$from" "$want" applied
   echo "EPP set to $want on $n cpus"
 }
 
 cmd_turbo() {
   local want=${1:-}
-  if [[ -z $want ]]; then [[ $(rd $PSTATE/no_turbo) == 0 ]] && echo on || echo off; return; fi
+  if [[ -z $want ]]; then turbo_state; return; fi
   # no_turbo is inverted
   local b; b=$(to_bool "$want")
-  wr $PSTATE/no_turbo "$(( 1 - b ))" || return 1
-  echo "turbo: $([[ $(rd $PSTATE/no_turbo) == 0 ]] && echo on || echo off)"
+  local from to
+  from=$(turbo_state)
+  to=$(onoff "$b")
+  wr_logged turbo $PSTATE/no_turbo "$from" "$to" "$(( 1 - b ))" || return 1
+  echo "turbo: $(turbo_state)"
 }
 
 cmd_cpu_limit() {
@@ -243,14 +515,32 @@ cmd_cpu_limit() {
     echo "note: CPU power limits are only honoured in the 'custom' platform profile." >&2
     echo "      run: lenovo-power profile custom" >&2
   }
-  local lo hi
+  # Both limits are validated before either is offered, so the prompt never asks
+  # about a value the firmware would go on to reject.
+  local lo hi from1 from2 rows
   lo=$(rd $FWA/ppt_pl1_spl/min_value); hi=$(rd $FWA/ppt_pl1_spl/max_value)
   (( pl1 >= lo && pl1 <= hi )) || die "PL1 must be ${lo}-${hi} W"
-  wr $FWA/ppt_pl1_spl/current_value "$pl1" || return 1
   if [[ -n $pl2 ]]; then
     lo=$(rd $FWA/ppt_pl2_sppt/min_value); hi=$(rd $FWA/ppt_pl2_sppt/max_value)
     (( pl2 >= lo && pl2 <= hi )) || die "PL2 must be ${lo}-${hi} W"
-    wr $FWA/ppt_pl2_sppt/current_value "$pl2" || return 1
+  fi
+
+  from1=$(rd $FWA/ppt_pl1_spl/current_value)
+  from2=$(rd $FWA/ppt_pl2_sppt/current_value)
+  rows=("PL1 sustained|${from1} W|${pl1} W")
+  [[ -n $pl2 ]] && rows+=("PL2 burst|${from2} W|${pl2} W")
+  gate cpu-limit "${rows[@]}" || return 1
+  state_set armed_cpu_pl1 "$from1"
+  [[ -n $pl2 ]] && state_set armed_cpu_pl2 "$from2"
+
+  if ! wr_logged cpu-limit-pl1 $FWA/ppt_pl1_spl/current_value "$from1" "$pl1"; then
+    raise_failed armed_cpu_pl1 armed_cpu_pl2
+    return 1
+  fi
+  if [[ -n $pl2 ]] && ! wr_logged cpu-limit-pl2 $FWA/ppt_pl2_sppt/current_value "$from2" "$pl2"; then
+    # PL1 did land, so that half stays armed and the latch stays off.
+    state_clear armed_cpu_pl2
+    return 1
   fi
   cmd_cpu_limit
 }
@@ -265,16 +555,25 @@ cmd_gpu_limit() {
       --format=csv,noheader,nounits | awk -F', ' '{printf "%s W (range %s-%s)\n",$1,$2,$3}'
     return
   fi
-  sudo nvidia-smi -pl "$want" >/dev/null || die "failed to set GPU power limit"
+  local from; from=$(gpu_power_limit)
+  gate gpu-limit "dGPU power cap|${from} W|${want} W" || return 1
+  state_set armed_gpu "$from"
+  if ! sudo nvidia-smi -pl "$want" >/dev/null; then
+    raise_failed armed_gpu
+    log_event "$ACTOR" gpu-limit "$from" "$want" failed
+    die "failed to set GPU power limit"
+  fi
+  log_event "$ACTOR" gpu-limit "$from" "$want" applied
   cmd_gpu_limit
 }
 
 # ---------------------------------------------------------------- toggles
 
-cmd_toggle() { # <label> <path> <arg>
-  local label=$1 path=$2 arg=${3:-}
+cmd_toggle() { # <setting> <label> <path> <arg>
+  local setting=$1 label=$2 path=$3 arg=${4:-}
   if [[ -z $arg ]]; then onoff "$(rd "$path")"; return; fi
-  wr "$path" "$(to_bool "$arg")" || return 1
+  local b; b=$(to_bool "$arg")
+  wr_logged "$setting" "$path" "$(onoff "$(rd "$path")")" "$(onoff "$b")" "$b" || return 1
   printf '%s: %s\n' "$label" "$(onoff "$(rd "$path")")"
 }
 
@@ -282,16 +581,269 @@ cmd_toggle() { # <label> <path> <arg>
 
 cmd_preset() {
   local p=${1:-}
+  # Everything a preset writes is attributed to the preset, so the log can tell
+  # a one-word command apart from the same settings changed by hand.
+  local from; from=$(rd $STATE_DIR/preset)
+  ACTOR=preset
   case "$p" in
     quiet)   cmd_profile low-power;   cmd_epp power;                cmd_turbo off ;;
     travel)  cmd_profile low-power;   cmd_epp balance_power;        cmd_turbo on  ;;
     work)    cmd_profile balanced;    cmd_epp balance_performance;  cmd_turbo on  ;;
     game)    cmd_profile performance; cmd_epp performance;          cmd_turbo on  ;;
-    max)     cmd_profile max-power;   cmd_epp performance;          cmd_turbo on  ;;
+    max)
+      # Asked once here rather than by the profile inside it, so a one-word
+      # command cannot walk around the guardrail it would otherwise trip.
+      GATE_NOTE="'preset max' includes 'profile max-power', which is why it asks."
+      gate preset "platform profile|$(rd $PROFILE)|max-power" \
+                  "EPP|$(rd $CPUDIR/cpu0/cpufreq/energy_performance_preference)|performance" \
+                  "turbo|$(turbo_state)|on" || return 1
+      cmd_profile max-power;   cmd_epp performance;          cmd_turbo on  ;;
     "")      [[ -r $STATE_DIR/preset ]] && cat "$STATE_DIR/preset" || echo "(none set)"; return ;;
     *) die "preset must be one of: quiet travel work game max" ;;
   esac
   mkdir -p "$STATE_DIR" && echo "$p" >"$STATE_DIR/preset"
+  log_event "$ACTOR" preset "${from:--}" "$p" applied
+}
+
+# ---------------------------------------------------------------- monitor
+#
+# The guard is explicitly not damage protection. The firmware's thermal ladder
+# is: it reacts in milliseconds, it cannot be switched off, and nothing here
+# weakens it. This is a comfort and longevity policy - it keeps the machine out
+# of the throttle zone, where it would otherwise sit hot and loud with the fans
+# at maximum. The firmware cannot make that call, because the firmware does not
+# know the user would rather have less performance.
+
+epoch() { date +%s; }
+
+notify() { # <urgency> <summary> <body>
+  have notify-send || return 0
+  notify-send -a lenovo-power -u "$1" "$2" "$3" 2>/dev/null || return 0
+}
+
+# The dGPU's remaining thermal margin in whole degrees, and only while the card
+# is already awake: polling a runtime-suspended card resumes it and costs about
+# 10 W, so monitoring must never be the thing that wakes it. Cards that do not
+# report a margin say so, and get no alerting.
+gpu_margin() {
+  [[ $(gpu_runtime_status) == active ]] || return 0
+  local m; m=$(nvidia-smi --query-gpu=temperature.gpu.tlimit --format=csv,noheader,nounits 2>/dev/null)
+  [[ $m =~ ^[0-9]+$ ]] && printf '%s\n' "$m"
+  return 0
+}
+
+# How long the reading has been continuously over its threshold, or empty when
+# it is not over it. The start of the run lives in the state file, because the
+# single poll and the loop share one another's history through it.
+sustained_for() { # <key> <over?> <now>
+  local key=$1 over=$2 now=$3 since
+  if [[ $over != 1 ]]; then state_clear "$key"; return 0; fi
+  since=$(state_get "$key")
+  if [[ -z $since ]]; then since=$now; state_set "$key" "$now"; fi
+  printf '%s\n' "$(( now - since ))"
+}
+
+# Give back whatever was raised - specifically that, since dropping the profile
+# alone would leave a raised GPU cap in place, and the cap lives outside the
+# platform profile entirely.
+guard_act() { # <temp> <held-for>
+  local temp=$1 held=$2 acted=0 gave=()
+  ACTOR=guard
+  LOG_DETAIL="CPU ${temp} C sustained ${held}s"
+
+  local prior
+  prior=$(state_get armed_profile)
+  if [[ -n $prior ]]; then
+    cmd_profile performance >/dev/null && gave+=("profile to performance")
+    state_clear armed_profile; acted=1
+  fi
+
+  prior=$(state_get armed_cpu_pl1)
+  if [[ -n $prior ]]; then
+    wr_logged cpu-limit-pl1 $FWA/ppt_pl1_spl/current_value \
+      "$(rd $FWA/ppt_pl1_spl/current_value)" "$prior" && gave+=("PL1 to ${prior} W")
+    state_clear armed_cpu_pl1; acted=1
+  fi
+
+  prior=$(state_get armed_cpu_pl2)
+  if [[ -n $prior ]]; then
+    wr_logged cpu-limit-pl2 $FWA/ppt_pl2_sppt/current_value \
+      "$(rd $FWA/ppt_pl2_sppt/current_value)" "$prior" && gave+=("PL2 to ${prior} W")
+    state_clear armed_cpu_pl2; acted=1
+  fi
+
+  prior=$(state_get armed_gpu)
+  # Only while the card is already awake. Monitoring must never be the thing
+  # that resumes a suspended dGPU, and a sleeping card draws nothing and adds no
+  # heat, so its raised cap can wait - it stays armed, and a later trigger gives
+  # it back once the card is up.
+  if [[ -n $prior && $(gpu_runtime_status) == active ]]; then
+    local default; default=$(gpu_default_limit)
+    # -n because this runs from a background service, where there is nobody to
+    # answer a password prompt; a refusal is recorded rather than waited on.
+    if [[ -n $default ]] && sudo -n nvidia-smi -pl "$default" >/dev/null 2>&1; then
+      log_event "$ACTOR" gpu-limit "$prior" "$default" applied
+      gave+=("dGPU cap to ${default} W")
+    else
+      log_event "$ACTOR" gpu-limit "$prior" "${default:--}" failed \
+        "nvidia-smi needs root, which a user service does not have"
+    fi
+    state_clear armed_gpu; acted=1
+  fi
+
+  (( acted )) || return 0
+
+  # Latch. Restoring automatically guarantees oscillation - drop, cool, restore,
+  # heat, drop - which would flap the profile and fill the log. The user
+  # re-enables deliberately, and the gate's hot refusal stops an immediate
+  # re-entry.
+  state_set latched "$(epoch)"
+
+  # The machine is by definition over the alert threshold too, and the guard's
+  # notification is the one that explains what just happened. Count this as the
+  # alert so the two do not arrive together.
+  state_set alert_last "$(epoch)"
+
+  local body="${LOG_DETAIL}. Gave back: $(join_list ${gave[@]+"${gave[@]}"})."
+  body+=" It stays here until you raise it again."
+  notify critical "Power budget given back" "$body"
+  echo "guard: $body"
+  LOG_DETAIL=
+}
+
+# One poll. The loop is a thin wrapper over exactly this, so what the loop does
+# every interval is what a single poll reports right now.
+monitor_poll() {
+  local verbose=${1:-0} temp margin held now
+  now=$(epoch)
+  temp=$(cpu_temp)
+
+  if [[ -z $temp ]]; then
+    (( verbose )) && echo "monitor: no CPU temperature sensor on this machine"
+    return 0
+  fi
+
+  # Guard first: at that temperature the alert has already had its say.
+  held=$(sustained_for hot_since "$([[ $temp -ge $GUARD_TEMP ]] && echo 1 || echo 0)" "$now")
+  if [[ -n $held ]] && (( held >= GUARD_SUSTAIN )); then
+    state_clear hot_since
+    guard_act "$temp" "$held"
+  fi
+
+  # Awareness while the machine is still coping, rate limited so a long hot
+  # session does not bury the notifications it sends.
+  held=$(sustained_for alert_since "$([[ $temp -ge $ALERT_TEMP ]] && echo 1 || echo 0)" "$now")
+  if [[ -n $held ]] && (( held >= ALERT_SUSTAIN )); then
+    local last; last=$(state_get alert_last)
+    if [[ -z $last ]] || (( now - last >= ALERT_REPEAT )); then
+      state_set alert_last "$now"
+      notify normal "CPU running hot" \
+        "${temp} °C, held for ${held}s. The firmware's fans stage in at 103 °C."
+      echo "alert: CPU ${temp} °C held for ${held}s"
+    fi
+  fi
+
+  margin=$(gpu_margin)
+  if [[ -n $margin ]] && (( margin <= GPU_MARGIN )); then
+    local last; last=$(state_get gpu_alert_last)
+    if [[ -z $last ]] || (( now - last >= ALERT_REPEAT )); then
+      state_set gpu_alert_last "$now"
+      notify normal "dGPU close to its thermal limit" \
+        "${margin} °C of thermal margin left."
+      echo "alert: dGPU has ${margin} °C of margin left"
+    fi
+  fi
+
+  if (( verbose )); then
+    printf 'CPU %s °C  (alert %s °C, guard %s °C)\n' "$temp" "$ALERT_TEMP" "$GUARD_TEMP"
+    [[ -n $margin ]] && printf 'dGPU %s °C of thermal margin  (alert at %s °C)\n' "$margin" "$GPU_MARGIN"
+    printf 'the guard would: %s\n' "$(guard_plan)"
+    [[ -n $(state_get latched) ]] && printf 'guard: latched %s\n' "$(latched_at)"
+  fi
+  return 0
+}
+
+# What the guard would do if it triggered right now, in the terms it would act
+# in. The profile goes to performance rather than back to whatever it was, so
+# naming the prior value here would promise a restore that will not happen.
+guard_plan() {
+  local out=()
+  [[ -n $(state_get armed_profile) ]] && out+=("drop the profile to performance")
+  [[ -n $(state_get armed_cpu_pl1) ]] && out+=("return PL1 to $(state_get armed_cpu_pl1) W")
+  [[ -n $(state_get armed_cpu_pl2) ]] && out+=("return PL2 to $(state_get armed_cpu_pl2) W")
+  [[ -n $(state_get armed_gpu) ]] && out+=("return the dGPU cap to the card's default")
+  (( ${#out[@]} )) || { echo "nothing - no raised power budget to give back"; return 0; }
+  join_list "${out[@]}"
+}
+
+latched_at() {
+  local t; t=$(state_get latched)
+  [[ -n $t ]] && date -d "@$t" '+%Y-%m-%d %H:%M' 2>/dev/null
+  return 0
+}
+
+cmd_monitor() {
+  case "${1:-}" in
+    once) monitor_poll 1 ;;
+    run)
+      # Deliberately not a systemd timer: the sustained-temperature windows are
+      # shorter than a timer's useful resolution, and the state file already
+      # carries the run across polls.
+      echo "lenovo-power monitor: polling every ${POLL_INTERVAL}s" \
+           "(alert ${ALERT_TEMP} °C/${ALERT_SUSTAIN}s, guard ${GUARD_TEMP} °C/${GUARD_SUSTAIN}s)"
+      while :; do
+        monitor_poll 0
+        sleep "$POLL_INTERVAL"
+      done ;;
+    *) die "monitor takes 'once' or 'run'" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- history
+
+cmd_history() {
+  # Dispatch passes an empty string when the argument is absent, so the default
+  # has to survive that as well as an unset parameter.
+  local n=${1:-}; n=${n:-20}
+  case "$n" in
+    all)     n=0 ;;
+    *[!0-9]*) die "history takes a number of entries, or 'all'" ;;
+  esac
+  [[ -s $LOG_FILE ]] || { echo "(no history yet)"; return 0; }
+
+  # Widths come from the rows actually being shown, so the columns are as narrow
+  # as the data allows rather than padded to some guessed maximum.
+  { if (( n > 0 )); then tail -n "$n" "$LOG_FILE"; else cat "$LOG_FILE"; fi; } | awk '
+    function jget(field,   v) {
+      if (!match($0, "\"" field "\":\"")) return "-"
+      v = substr($0, RSTART + RLENGTH)
+      v = substr(v, 1, index(v, "\"") - 1)
+      return v == "" ? "-" : v
+    }
+    function wider(col, v) { if (length(v) > w[col]) w[col] = length(v) }
+    BEGIN {
+      split("TIME ACTOR SETTING FROM TO OUTCOME DETAIL", head, " ")
+      for (c = 1; c <= 7; c++) w[c] = length(head[c])
+    }
+    {
+      n++
+      # "2026-09-01T14:30:00-04:00" reads better as a date and a wall clock.
+      ts = jget("ts"); sub("T", " ", ts); ts = substr(ts, 1, 16)
+      row[n, 1] = ts
+      row[n, 2] = jget("actor");   row[n, 3] = jget("setting")
+      row[n, 4] = jget("from");    row[n, 5] = jget("to")
+      row[n, 6] = jget("outcome"); row[n, 7] = jget("detail")
+      for (c = 1; c <= 7; c++) wider(c, row[n, c])
+    }
+    END {
+      # The detail column is last and ragged, so it is never padded.
+      for (c = 1; c <= 6; c++) printf "%-*s  ", w[c], head[c]
+      printf "%s\n", head[7]
+      for (r = 1; r <= n; r++) {
+        for (c = 1; c <= 6; c++) printf "%-*s  ", w[c], row[r, c]
+        printf "%s\n", row[r, 7]
+      }
+    }'
 }
 
 # ---------------------------------------------------------------- perms
@@ -337,6 +889,56 @@ cmd_install_perms() {
   exit 1
 }
 
+cmd_install_monitor() {
+  local self unit_dir unit
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  unit="$unit_dir/lenovo-power-monitor.service"
+  mkdir -p "$unit_dir" || die "cannot create $unit_dir"
+
+  # A user service, not a system one. The monitor only writes platform_profile
+  # and the firmware-attribute power limits, which install-perms already hands
+  # to the wheel group, so it can de-escalate with no privilege escalation and
+  # no password prompt from a background process.
+  cat >"$unit" <<UNITEOF
+[Unit]
+Description=Lenovo power thermal monitor
+Documentation=https://github.com/rwildcard/lenovo-power
+
+[Service]
+Type=simple
+ExecStart=$self monitor run
+Restart=on-failure
+RestartSec=30
+
+# Thresholds. Edit them here, then:
+#   systemctl --user daemon-reload && systemctl --user restart lenovo-power-monitor
+Environment=LENOVO_POWER_ALERT_TEMP=$ALERT_TEMP
+Environment=LENOVO_POWER_ALERT_SUSTAIN=$ALERT_SUSTAIN
+Environment=LENOVO_POWER_ALERT_REPEAT=$ALERT_REPEAT
+Environment=LENOVO_POWER_GUARD_TEMP=$GUARD_TEMP
+Environment=LENOVO_POWER_GUARD_SUSTAIN=$GUARD_SUSTAIN
+Environment=LENOVO_POWER_GPU_MARGIN=$GPU_MARGIN
+Environment=LENOVO_POWER_POLL_INTERVAL=$POLL_INTERVAL
+
+[Install]
+WantedBy=default.target
+UNITEOF
+
+  systemctl --user daemon-reload || die "systemctl --user daemon-reload failed"
+  systemctl --user enable --now lenovo-power-monitor.service ||
+    die "could not enable lenovo-power-monitor.service"
+
+  echo "Installed and started:"
+  echo "  $unit"
+  echo
+  echo "It warns at ${ALERT_TEMP} °C held for ${ALERT_SUSTAIN}s, and gives back a raised power"
+  echo "budget at ${GUARD_TEMP} °C held for ${GUARD_SUSTAIN}s. Check it now without waiting:"
+  echo "  lenovo-power monitor once"
+  echo
+  echo "Stop it again with:  systemctl --user disable --now lenovo-power-monitor"
+}
+
 usage() {
   cat <<'USAGE'
 lenovo-power - control Lenovo Legion power settings
@@ -351,11 +953,29 @@ lenovo-power - control Lenovo Legion power settings
   battery-cap [on|off]          conservation mode - hold charge at ~60%
   usb-charging [on|off]         charge USB devices while the lid is shut
   fn-lock [on|off]              Fn key lock
+  history [N|all]               the last N power changes (default 20)
+  monitor once|run              one temperature poll, or keep polling
   install-perms                 allow the wheel group to write these knobs (no more sudo)
+  install-monitor               start watching the temperature (a user service)
 
 Reading a setting: omit the argument.
+
+Raising a power budget - max-power, custom, cpu-limit, gpu-limit - asks first.
+Pass --yes to skip the prompt from a script or a keybinding; it does not
+override the refusal to raise while the CPU is already hot.
 USAGE
 }
+
+# --yes may appear anywhere, so a keybinding or a script can append it without
+# having to care where the command's own arguments end.
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES=1 ;;
+    *)        args+=("$arg") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
 
 case "${1:-status}" in
   status|"")      cmd_status ;;
@@ -365,10 +985,13 @@ case "${1:-status}" in
   turbo)          cmd_turbo "${2:-}" ;;
   cpu-limit)      cmd_cpu_limit "${2:-}" "${3:-}" ;;
   gpu-limit)      cmd_gpu_limit "${2:-}" ;;
-  battery-cap)    cmd_toggle "conservation mode" $VPC/conservation_mode "${2:-}" ;;
-  usb-charging)   cmd_toggle "USB always-on" $VPC/usb_charging "${2:-}" ;;
-  fn-lock)        cmd_toggle "Fn lock" $VPC/fn_lock "${2:-}" ;;
+  battery-cap)    cmd_toggle battery-cap "conservation mode" $VPC/conservation_mode "${2:-}" ;;
+  usb-charging)   cmd_toggle usb-charging "USB always-on" $VPC/usb_charging "${2:-}" ;;
+  fn-lock)        cmd_toggle fn-lock "Fn lock" $VPC/fn_lock "${2:-}" ;;
+  history)        cmd_history "${2:-}" ;;
+  monitor)        cmd_monitor "${2:-}" ;;
   install-perms)  cmd_install_perms ;;
+  install-monitor) cmd_install_monitor ;;
   -h|--help|help) usage ;;
   *)              usage; exit 1 ;;
 esac

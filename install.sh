@@ -19,3 +19,6 @@ esac
 echo
 echo "Next: run 'lenovo-power install-perms' once so the sysfs knobs are"
 echo "writable without sudo, then 'lenovo-power' to see current state."
+echo
+echo "The temperature monitor is opt-in and stays off until you ask for it:"
+echo "  lenovo-power install-monitor"

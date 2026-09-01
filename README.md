@@ -45,6 +45,13 @@ lenovo-power install-perms   # one-time, asks for your password
 attributes and installs a systemd unit that reapplies it on every boot. Without
 it the tools still read everything and fall back to `sudo` for writes.
 
+The temperature monitor is separate and opt-in -- nothing starts notifying you
+until you ask for it:
+
+```bash
+lenovo-power install-monitor   # a systemd *user* service, no root needed
+```
+
 ## CLI
 
 ```
@@ -58,9 +65,13 @@ lenovo-power gpu-limit [WATTS]       # NVIDIA dGPU cap; needs sudo
 lenovo-power battery-cap [on|off]    # conservation mode, holds charge at ~60%
 lenovo-power usb-charging [on|off]
 lenovo-power fn-lock [on|off]
+lenovo-power history [N|all]         # the last N power changes (default 20)
+lenovo-power monitor once            # one poll: what the guard sees and would do
+lenovo-power install-monitor         # run the monitor as a user service
 ```
 
-Omit the argument to read a setting instead of writing it.
+Omit the argument to read a setting instead of writing it. Commands that raise
+a power budget ask first; `--yes` skips the prompt.
 
 ## GUI
 
@@ -184,6 +195,129 @@ machine unsafe -- it makes it hot and loud sooner, and the ladder still catches
 it. Picking a lower budget is a comfort, noise and battery decision, not a
 safety one.
 
+## Raising a power budget asks first
+
+`max-power`, `custom`, `cpu-limit` and `gpu-limit` confirm before they apply.
+The prompt is where the tool explains itself rather than just nagging: it names
+the setting, what it is now, what it would become, and what the change is and
+is not.
+
+```
+lenovo-power: this raises a power budget.
+
+  platform profile   balanced  ->  max-power
+
+  This changes how many watts the hardware may draw, at stock clocks. It is
+  not overclocking: no clock multiplier and no voltage is touched, and the
+  firmware's thermal ladder still applies and cannot be disabled.
+
+  The thermal guard gives this back if the CPU stays at or above 100 °C
+  for 60s.
+
+  Apply? [y/N]
+```
+
+- **`--yes` skips it**, so keybindings and scripts never hang waiting on input.
+- **No terminal means no.** Run from a keybinding with nothing to prompt on, the
+  command refuses rather than proceeding: a gate that opens itself when nobody
+  is watching is not a gate.
+- **A CPU already at 100 °C refuses outright**, and `--yes` does *not* override
+  that one. A scripting convenience should not punch through a thermal guard.
+- **`preset max` asks once, up front**, naming that it includes `max-power`, so
+  a one-word command cannot walk around the guardrail.
+
+That list -- `max-power`, `custom`, `cpu-limit`, `gpu-limit` -- is also exactly
+the set that arms the thermal guard below. One list serves both, so a future
+power-raising command wires up both and neither can be forgotten.
+
+## The thermal guard
+
+Opt in with `lenovo-power install-monitor`. It runs as a systemd **user**
+service; it needs no root, because the only things it writes are the knobs
+`install-perms` already handed to the `wheel` group.
+
+| CPU temperature | Held for | What happens |
+|---|---|---|
+| 95 °C | 30 s | a notification, repeated at most every 10 minutes |
+| 100 °C | 60 s | gives back whatever power budget was raised, then stops |
+
+Both sit above ordinary load and below the firmware's first fan stage at
+103 °C, so the alert always precedes the guard and both precede the ladder. All
+of them are `Environment=` lines in the unit, so they can be tuned without
+editing the tool. `lenovo-power monitor once` reports what the guard sees, and
+would do, right now.
+
+**This is not damage protection.** The firmware ladder above is, it reacts in
+milliseconds, and nothing here weakens it. The guard is a comfort and longevity
+policy: it keeps the machine out of the throttle zone, where it would otherwise
+sit hot and loud with the fans at maximum. Firmware cannot make that call
+because firmware does not know you would rather have less performance.
+
+Some deliberate choices:
+
+- **It reverses what was raised**, specifically: the profile to `performance`,
+  `cpu-limit` to the value recorded before the raise, `gpu-limit` to the card's
+  default. Dropping the profile alone would leave a raised GPU cap in place,
+  because that cap lives outside the platform profile entirely.
+
+  The GPU half has a caveat. The profile and the CPU limits are sysfs knobs that
+  `install-perms` already hands to the `wheel` group, so the user service writes
+  them directly. `nvidia-smi -pl` has no such route and needs root, so from an
+  unprivileged service it fails, and the guard records that in the log rather
+  than pretending otherwise:
+
+  ```
+  guard  gpu-limit  140.00  70.00  failed  nvidia-smi needs root, which a user service does not have
+  ```
+
+  If you want that half to work, give your user a passwordless sudoers entry for
+  `nvidia-smi -pl`. The tool will not install one for you: nothing here should
+  quietly widen what you can do as root.
+- **It latches rather than restoring.** Restoring automatically guarantees
+  oscillation -- drop, cool, restore, heat, drop -- flapping the profile and
+  filling the log. You re-enable deliberately, and the hot refusal above stops
+  an immediate re-entry. `status` says when the guard is latched, so a profile
+  that will not stick is never a mystery.
+- **It never wakes a sleeping dGPU.** The card is polled only when its runtime
+  power-management state is already `active`, the same invariant the panel
+  observes -- including when giving a cap back, so a sleeping card keeps its
+  raised cap (it is drawing nothing and adding no heat) until it next wakes. GPU
+  alerting is expressed in *thermal margin*: degrees of headroom left, which is
+  what `temperature.gpu.tlimit` reports on this card, rather than an absolute
+  temperature that would mean nothing here.
+
+`monitor once` is one real poll, not a rehearsal: it reports the temperature
+against the thresholds and what the guard would do right now, and if the machine
+is genuinely over the line it acts, exactly as a poll from the loop would. That
+is deliberate -- the loop is a thin wrapper over the same single poll, so there
+is only one behaviour to reason about.
+
+Notifications go through `notify-send`, so they need a notification daemon.
+Verified on this machine: `org.freedesktop.Notifications` is owned by the
+desktop shell (`quickshell`) rather than by a standalone daemon, which is why
+looking for the usual daemon process names finds nothing.
+
+## Why is my machine like this?
+
+Every write, every guard action and every refusal is appended to a transaction
+log at `${XDG_STATE_HOME:-~/.local/state}/lenovo-power/log.jsonl`, and
+`lenovo-power history` renders it:
+
+```
+TIME              ACTOR  SETTING        FROM         TO           OUTCOME  DETAIL
+2026-09-01 14:28  user   profile        balanced     max-power    applied  -
+2026-09-01 14:28  user   cpu-limit-pl1  70           135          applied  -
+2026-09-01 14:41  guard  profile        max-power    performance  applied  CPU 101 C sustained 60s
+2026-09-01 14:41  guard  cpu-limit-pl1  135          70           applied  CPU 101 C sustained 60s
+2026-09-01 14:42  user   profile        performance  max-power    refused  CPU at 101 C, at or above the guard trigger
+```
+
+The actor column separates your own changes from the guard's and from presets,
+so "did I do that, or did something else?" always has an answer. Reads are
+never logged. The file is JSONL because its only readers are machines --
+`history` is the human view -- and it is capped at 5,000 entries, trimmed back
+to 4,000 when it fills, with no logrotate or other external dependency.
+
 ## Caveat: custom profile and CPU power limits
 
 The kernel lists `custom` in `platform_profile_choices`, but writing it returns
@@ -229,8 +363,16 @@ tests/bats/bin/bats tests     # or just `bats tests` if you have it installed
 the CLI hangs off it and it is empty in normal use, so with it unset the tool
 reads and writes the real `/sys` exactly as it always did; point it at a
 temporary tree and the same command reads and writes fake files there instead.
-The tests also fake `powerprofilesctl`, `nvidia-smi` and `sudo` through `PATH`
-and redirect `XDG_STATE_HOME`, so nothing a test does escapes its own directory.
+The tests also fake `powerprofilesctl`, `nvidia-smi`, `notify-send`, `sudo` and
+`systemctl` through `PATH` and redirect `XDG_STATE_HOME` and `XDG_CONFIG_HOME`,
+so nothing a test does escapes its own directory.
+
+The threshold environment variables double as the test harness. The paths that
+matter most here are the ones impossible to reach on a real machine at idle -- a
+CPU at 101 °C refusing a power raise, a sustained overage triggering
+de-escalation, a raised GPU cap being given back. Writing a temperature into a
+file and turning the sustain window down makes all of them testable without
+heating anything.
 
 ## Hyprland integration
 

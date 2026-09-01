@@ -103,6 +103,32 @@ esac
 exit 0'
   stub_command omarchy-powerprofiles-set
   stub_command nvidia-smi
+  stub_command notify-send
+  stub_command systemctl
+}
+
+# Put an awake dGPU in the fake tree, reporting MARGIN degrees of thermal
+# headroom, so the monitor has a card worth polling.
+fake_awake_gpu() {
+  fake_file sys/bus/pci/devices/0000:01:00.0/power/runtime_status active
+  mkdir -p "$STUB_DIR" "$STUB_LOG"
+  cat >"$STUB_DIR/nvidia-smi" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$STUB_LOG/nvidia-smi"
+case "\$*" in
+  *temperature.gpu.tlimit*) echo '$1' ;;
+  *power.default_limit*)    echo '70.00' ;;
+  *)                        echo '140.00' ;;
+esac
+STUB
+  chmod +x "$STUB_DIR/nvidia-smi"
+}
+
+# A sudo that runs the command instead of refusing it, for the few tests about
+# what happens once a privileged write succeeds. Sudo's own flags are dropped
+# first, so `sudo -n nvidia-smi ...` reaches nvidia-smi rather than exec.
+stub_permissive_sudo() {
+  stub_command sudo 'while [[ ${1:-} == -* ]]; do shift; done; exec "$@"'
 }
 
 # Keep the transaction log, preset and anything else stateful out of the real
@@ -110,11 +136,59 @@ exit 0'
 setup_state_dir() {
   export HOME="$BATS_TEST_TMPDIR/home"
   export XDG_STATE_HOME="$HOME/.local/state"
-  mkdir -p "$XDG_STATE_HOME"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  mkdir -p "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
 }
 
 setup_test_environment() {
   setup_fake_hardware
   setup_stubs
   setup_state_dir
+}
+
+# Fill the transaction log with N synthetic entries, numbered so a test can see
+# which of them survived a trim.
+seed_log() {
+  local dir="$XDG_STATE_HOME/lenovo-power"
+  mkdir -p "$dir"
+  awk -v n="$1" 'BEGIN {
+    for (i = 1; i <= n; i++)
+      printf "{\"ts\":\"2026-01-01T00:00:00+00:00\",\"actor\":\"user\"," \
+             "\"setting\":\"seed-%d\",\"from\":\"-\",\"to\":\"-\"," \
+             "\"outcome\":\"applied\"}\n", i
+  }' >"$dir/log.jsonl"
+}
+
+# The transaction log, as raw JSONL lines.
+log_lines() { cat "$XDG_STATE_HOME/lenovo-power/log.jsonl" 2>/dev/null; }
+
+# One field of one log line. LINE is a sed address, so 1 is the first entry and
+# $ the most recent.
+log_field() {
+  local line
+  line=$(log_lines | sed -n "$1p")
+  [[ $line =~ \"$2\":\"([^\"]*)\" ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Run the CLI on a pseudo-terminal, answering its prompt with REPLY, so a test
+# with no terminal of its own can still exercise the interactive gate. The
+# terminal echoes and ends lines with CR, neither of which is behaviour worth
+# asserting on, so both are stripped.
+run_on_tty() {
+  local reply=$1 cmd out rc; shift
+  printf -v cmd '%q ' "$LENOVO_POWER" "$@"
+  # Captured rather than piped straight into tr, so the exit status is the
+  # command's own and not the tidying that follows it.
+  out=$(printf '%s\n' "$reply" | script -qec "$cmd" /dev/null); rc=$?
+  printf '%s\n' "$out" | tr -d '\r'
+  return $rc
+}
+
+# Set the fake CPU package temperature, in whole degrees C.
+fake_cpu_temp() { fake_file sys/class/hwmon/hwmon4/temp1_input "$(( $1 * 1000 ))"; }
+
+# What the state file records under KEY, or empty if it records nothing.
+state_value() {
+  awk -F'\t' -v k="$1" '$1 == k { print $2 }' \
+    "$XDG_STATE_HOME/lenovo-power/state" 2>/dev/null
 }

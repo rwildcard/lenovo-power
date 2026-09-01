@@ -17,7 +17,9 @@ setup() {
 }
 
 @test "profile writes the new profile into the fake platform_profile file" {
-  run "$LENOVO_POWER" profile max-power
+  # max-power raises a power budget, so it asks first; this test is about where
+  # the write lands, not about the gate.
+  run "$LENOVO_POWER" profile max-power --yes
 
   [ "$status" -eq 0 ]
   [ "$(fake_value sys/firmware/acpi/platform_profile)" = max-power ]
