@@ -208,10 +208,29 @@ with Fn+Q, `cpu-limit` should then work; reports welcome.
 | EPP | `cpu*/cpufreq/energy_performance_preference` | power .. performance |
 | Turbo | `intel_pstate/no_turbo` | 0/1 |
 | Fan RPM | `hwmon/*/fan[12]_input` | read-only |
+| CPU temperature | `hwmon/coretemp/temp*_input` | read-only |
 
 Note this machine has no `charge_control_end_threshold`; Lenovo uses
 `conservation_mode` instead, which is why generic battery-threshold tooling
 finds nothing here.
+
+## Tests
+
+The suite drives the real `lenovo-power` against a directory of fake hardware
+files, so it checks behaviour without touching the machine. `bats-core` is
+vendored as a submodule:
+
+```bash
+git submodule update --init   # first time only
+tests/bats/bin/bats tests     # or just `bats tests` if you have it installed
+```
+
+`LENOVO_POWER_SYSFS_ROOT` is what makes that possible. Every hardware path in
+the CLI hangs off it and it is empty in normal use, so with it unset the tool
+reads and writes the real `/sys` exactly as it always did; point it at a
+temporary tree and the same command reads and writes fake files there instead.
+The tests also fake `powerprofilesctl`, `nvidia-smi` and `sudo` through `PATH`
+and redirect `XDG_STATE_HOME`, so nothing a test does escapes its own directory.
 
 ## Hyprland integration
 

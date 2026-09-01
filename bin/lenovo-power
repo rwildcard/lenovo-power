@@ -4,12 +4,20 @@
 
 set -uo pipefail
 
-PROFILE=/sys/firmware/acpi/platform_profile
-PROFILE_CHOICES=/sys/firmware/acpi/platform_profile_choices
-VPC=$(echo /sys/bus/platform/devices/VPC2004:*[0-9] | cut -d' ' -f1)
-FWA=/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes
-PSTATE=/sys/devices/system/cpu/intel_pstate
-CPUDIR=/sys/devices/system/cpu
+# Every hardware path hangs off this root. It is empty in normal use, so the
+# paths below are the real sysfs ones; the tests point it at a directory of
+# fake hardware files to exercise the tool without a Legion under it.
+SYS="${LENOVO_POWER_SYSFS_ROOT:-}/sys"
+
+PROFILE=$SYS/firmware/acpi/platform_profile
+PROFILE_CHOICES=$SYS/firmware/acpi/platform_profile_choices
+vpc_devices=("$SYS"/bus/platform/devices/VPC2004:*[0-9]); VPC=${vpc_devices[0]}
+FWA=$SYS/class/firmware-attributes/lenovo-wmi-other-0/attributes
+PSTATE=$SYS/devices/system/cpu/intel_pstate
+CPUDIR=$SYS/devices/system/cpu
+HWMON=$SYS/class/hwmon
+PCIDIR=$SYS/bus/pci/devices
+BAT=$SYS/class/power_supply/BAT0
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lenovo-power"
 
 # ppd profile name <-> firmware platform_profile name
@@ -31,7 +39,9 @@ wr() {
     echo "  $(basename "$path"): kernel rejected '$val'${err:+ (${err##*: })}" >&2
     return 1
   fi
-  if have sudo; then
+  # A non-empty root means these are fake files someone pointed us at, so never
+  # escalate: sudo must not follow a path the environment chose.
+  if [[ -z ${LENOVO_POWER_SYSFS_ROOT:-} ]] && have sudo; then
     # Try a cached/passwordless sudo first so scripts and keybinds never hang.
     printf '%s' "$val" | sudo -n tee "$path" >/dev/null 2>&1 && return 0
     if [[ -t 0 || -t 1 || -t 2 ]]; then
@@ -47,10 +57,32 @@ rd() { [[ -r $1 ]] && cat "$1" 2>/dev/null; }
 # Runtime PM state of the first NVIDIA PCI function, without waking it.
 gpu_runtime_status() {
   local d
-  for d in /sys/bus/pci/devices/*; do
+  for d in "$PCIDIR"/*; do
     [[ $(rd "$d/vendor") == 0x10de ]] || continue
     [[ $(rd "$d/class") == 0x030000 ]] || continue
     rd "$d/power/runtime_status"; return
+  done
+}
+
+# The first hwmon directory reporting the given driver name, e.g. coretemp.
+hwmon_by_name() {
+  local h
+  for h in "$HWMON"/hwmon*; do
+    [[ $(rd "$h/name") == "$1" ]] || continue
+    echo "$h"; return 0
+  done
+  return 1
+}
+
+# CPU package temperature in whole degrees C, from coretemp's "Package" sensor.
+# Silent when coretemp or that sensor is absent; the caller shows a placeholder.
+cpu_temp() {
+  local h l v
+  h=$(hwmon_by_name coretemp) || return
+  for l in "$h"/temp*_label; do
+    [[ $(rd "$l") == *Package* ]] || continue
+    v=$(rd "${l%_label}_input") && [[ -n $v ]] && echo $(( (v + 500) / 1000 ))
+    return
   done
 }
 
@@ -66,12 +98,13 @@ to_bool() {
 # ---------------------------------------------------------------- status
 
 cmd_status() {
-  local prof choices cons usbc fnl pl1 pl2 epp turbo
+  local prof choices cons usbc fnl pl1 pl2 epp turbo temp
   prof=$(rd $PROFILE); choices=$(rd $PROFILE_CHOICES)
   cons=$(rd $VPC/conservation_mode); usbc=$(rd $VPC/usb_charging); fnl=$(rd $VPC/fn_lock)
   pl1=$(rd $FWA/ppt_pl1_spl/current_value); pl2=$(rd $FWA/ppt_pl2_sppt/current_value)
   epp=$(rd $CPUDIR/cpu0/cpufreq/energy_performance_preference)
   turbo=$(rd $PSTATE/no_turbo)
+  temp=$(cpu_temp); temp=${temp:+$temp °C}
 
   echo "Power profile"
   printf '  platform profile   %s\n' "${prof:-n/a}"
@@ -82,6 +115,7 @@ cmd_status() {
 
   echo
   echo "CPU"
+  printf '  temperature        %s\n' "${temp:-n/a}"
   printf '  EPP                %s\n' "${epp:-n/a}"
   printf '  turbo              %s\n' "$([[ ${turbo:-1} == 0 ]] && echo on || echo off)"
   printf '  PL1 sustained      %s W  (range %s-%s, default %s)\n' \
@@ -108,8 +142,8 @@ cmd_status() {
   echo
   echo "Battery"
   local cap st rate
-  cap=$(rd /sys/class/power_supply/BAT0/capacity); st=$(rd /sys/class/power_supply/BAT0/status)
-  rate=$(rd /sys/class/power_supply/BAT0/power_now)
+  cap=$(rd $BAT/capacity); st=$(rd $BAT/status)
+  rate=$(rd $BAT/power_now)
   printf '  charge             %s%% (%s)\n' "${cap:-?}" "${st:-?}"
   [[ -n $rate ]] && printf '  draw               %.1f W\n' "$(awk -v u="$rate" 'BEGIN{print u/1000000}')"
   printf '  conservation mode  %s  (caps charge ~60%% to preserve the cell)\n' "$(onoff "${cons:-}")"
@@ -119,10 +153,9 @@ cmd_status() {
   printf '  USB always-on      %s\n' "$(onoff "${usbc:-}")"
   printf '  Fn lock            %s\n' "$(onoff "${fnl:-}")"
   local f1 f2 h
-  for h in /sys/class/hwmon/hwmon*; do
-    [[ $(rd "$h/name") == lenovo_wmi_other ]] || continue
-    f1=$(rd "$h/fan1_input"); f2=$(rd "$h/fan2_input"); break
-  done
+  if h=$(hwmon_by_name lenovo_wmi_other); then
+    f1=$(rd "$h/fan1_input"); f2=$(rd "$h/fan2_input")
+  fi
   [[ -n ${f1:-} ]] && printf '  fans               %s / %s rpm (read-only)\n' "$f1" "$f2"
 
   # Nudge toward the one-time setup if the knobs still need root.
