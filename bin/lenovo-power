@@ -245,8 +245,16 @@ cmd_preset() {
 # ---------------------------------------------------------------- perms
 
 cmd_install_perms() {
-  local installer="$HOME/.local/share/lenovo-power/install-perms.sh"
-  [[ -x $installer ]] || die "installer missing: $installer"
+  # Resolve through the symlink in ~/.local/bin back to the repo checkout, so
+  # the installer that ships alongside this script is the one that runs.
+  local self here installer
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  here=$(dirname "$self")
+  for installer in "$here/../scripts/install-perms.sh" \
+                   "$HOME/.local/share/lenovo-power/install-perms.sh"; do
+    [[ -x $installer ]] && break
+  done
+  [[ -x $installer ]] || die "installer not found next to $self"
   echo "This grants group 'wheel' write access to the Lenovo power sysfs knobs,"
   echo "so lenovo-power no longer needs sudo. Requires your password."
   echo
