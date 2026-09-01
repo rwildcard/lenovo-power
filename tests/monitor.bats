@@ -412,3 +412,72 @@ setup() {
   run "$LENOVO_POWER" status
   [[ $output == *"profile to performance"* ]]
 }
+
+# ------------------------------------------------- a give-back that cannot land
+
+@test "a give-back that fails keeps the setting armed, and a later poll retries" {
+  export LENOVO_POWER_GUARD_SUSTAIN=0
+  fake_awake_gpu 40
+  stub_permissive_sudo
+  run "$LENOVO_POWER" gpu-limit 140 --yes
+
+  # A user service has nobody to answer for root, so the give-back cannot land.
+  stub_command sudo 'exit 1'
+  fake_cpu_temp 101
+  run "$LENOVO_POWER" monitor once
+
+  [ "$(log_field '$' setting)" = gpu-limit ]
+  [ "$(log_field '$' outcome)" = failed ]
+
+  # Still armed, so the guard has not claimed a give-back that did not happen.
+  run "$LENOVO_POWER" monitor once
+  [[ $output == *"dGPU cap"* ]]
+  run "$LENOVO_POWER" status
+  [[ $output != *latched* ]]
+
+  # Root comes back, and the retry lands.
+  stub_permissive_sudo
+  run "$LENOVO_POWER" monitor once
+
+  [[ $(stub_calls nvidia-smi) == *"-pl 70.00"* ]]
+  run "$LENOVO_POWER" status
+  [[ $output == *latched* ]]
+}
+
+@test "the plan says what the dGPU cap was raised from" {
+  stub_command nvidia-smi 'printf "70.00\n"'
+  stub_permissive_sudo
+  run "$LENOVO_POWER" gpu-limit 140 --yes
+
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"raised from 70.00 W"* ]]
+}
+
+@test "a second give-back adds to the latch summary rather than replacing it" {
+  export LENOVO_POWER_GUARD_SUSTAIN=0
+  fake_awake_gpu 40
+  stub_permissive_sudo
+  run "$LENOVO_POWER" gpu-limit 140 --yes
+  run "$LENOVO_POWER" profile max-power --yes
+
+  # The card sleeps, so only the profile can go back on this trigger.
+  fake_file sys/bus/pci/devices/0000:01:00.0/power/runtime_status suspended
+  fake_cpu_temp 101
+  run "$LENOVO_POWER" monitor once
+
+  run "$LENOVO_POWER" status
+  [[ $output == *"profile to performance"* ]]
+  [[ $output != *"dGPU cap"* ]]
+  local first; first=$(printf '%s\n' "$output" | grep "thermal guard")
+
+  # The card wakes, and the next trigger gives back what was left behind.
+  fake_file sys/bus/pci/devices/0000:01:00.0/power/runtime_status active
+  run "$LENOVO_POWER" monitor once
+
+  run "$LENOVO_POWER" status
+  [[ $output == *"profile to performance"* ]]
+  [[ $output == *"dGPU cap"* ]]
+  # One episode, so the moment it latched does not move.
+  [[ $(printf '%s\n' "$output" | grep "thermal guard") == "${first%%: *}"* ]]
+}

@@ -40,8 +40,6 @@ LOG_KEEP=4000
 ASSUME_YES=0
 GATE_SATISFIED=0
 GATE_NOTE=
-GATE_PRIOR_LATCH=
-GATE_PRIOR_GAVE=
 
 # Thresholds. Compiled-in defaults, overridable by environment so the systemd
 # unit can tune them without this needing a config file parser. They sit above
@@ -55,7 +53,7 @@ GUARD_SUSTAIN=${LENOVO_POWER_GUARD_SUSTAIN:-60}
 GPU_MARGIN=${LENOVO_POWER_GPU_MARGIN:-5}
 POLL_INTERVAL=${LENOVO_POWER_POLL_INTERVAL:-10}
 
-# The armed set: the platform profiles that raise a power budget. Together with
+# The raising profiles: the profiles whose selection is itself a raise. With
 # cpu-limit and gpu-limit these are exactly the commands that both ask for
 # confirmation and arm the thermal guard - one list serving both purposes, so a
 # future power-raising command wires up both and neither can be forgotten.
@@ -238,21 +236,167 @@ to_bool() {
   esac
 }
 
+# ------------------------------------------------------------- the armed set
+#
+# What the guard is holding: one entry per raise that has not been given back,
+# each keeping the setting's value from before the raise. The gate writes an
+# entry, the guard reads them, gives back what it can, and latches.
+#
+# One table, so a new raisable setting is a row and three small handlers rather
+# than an edit in five places. Each setting names:
+#
+#   budget_read_<key>              its current raw value
+#   budget_plan_<key> <prior>      how to say what would be given back
+#   budget_reverse_<key> <prior>   give it back, and say what was given back
+#
+# A reverse handler returns 0 when it gave the setting back, 1 when it tried
+# and failed, and 2 when it cannot try yet. Only 0 disarms the entry: a failure
+# or a deferral stays armed for the next poll (docs/adr/0001).
+BUDGET_SETTINGS="profile cpu_pl1 cpu_pl2 gpu"
+
+# Not back to the prior value: a raise is given back by dropping to
+# performance, which is why the plan does not name where it came from.
+budget_read_profile()    { rd $PROFILE; }
+budget_plan_profile()    { echo "drop the profile to performance"; }
+budget_reverse_profile() {
+  cmd_profile performance >/dev/null || return 1
+  echo "profile to performance"
+}
+
+budget_read_cpu_pl1()    { rd $FWA/ppt_pl1_spl/current_value; }
+budget_plan_cpu_pl1()    { echo "return PL1 to ${1} W"; }
+budget_reverse_cpu_pl1() {
+  wr_logged cpu-limit-pl1 $FWA/ppt_pl1_spl/current_value \
+    "$(rd $FWA/ppt_pl1_spl/current_value)" "$1" || return 1
+  echo "PL1 to ${1} W"
+}
+
+budget_read_cpu_pl2()    { rd $FWA/ppt_pl2_sppt/current_value; }
+budget_plan_cpu_pl2()    { echo "return PL2 to ${1} W"; }
+budget_reverse_cpu_pl2() {
+  wr_logged cpu-limit-pl2 $FWA/ppt_pl2_sppt/current_value \
+    "$(rd $FWA/ppt_pl2_sppt/current_value)" "$1" || return 1
+  echo "PL2 to ${1} W"
+}
+
+budget_read_gpu() { gpu_power_limit; }
+budget_plan_gpu() { echo "return the dGPU cap to the card's default (raised from ${1} W)"; }
+# Only while the card is already awake. Monitoring must never be the thing that
+# resumes a suspended dGPU, and a sleeping card draws nothing and adds no heat,
+# so a raised cap waits for a poll that finds the card up.
+budget_reverse_gpu() {
+  local prior=$1 default
+  [[ $(gpu_runtime_status) == active ]] || return 2
+  default=$(gpu_default_limit)
+  # -n because this runs from a background service, where there is nobody to
+  # answer a password prompt; a refusal is recorded rather than waited on.
+  if [[ -n $default ]] && sudo -n nvidia-smi -pl "$default" >/dev/null 2>&1; then
+    log_event "$ACTOR" gpu-limit "$prior" "$default" applied
+    echo "dGPU cap to ${default} W"
+    return 0
+  fi
+  log_event "$ACTOR" gpu-limit "$prior" "${default:--}" failed \
+    "nvidia-smi needs root, which a user service does not have"
+  return 1
+}
+
+# What this process armed, so a raise that fails knows whether any part of it
+# landed. The latch is stashed once per run: a preset gates twice, and the
+# second gate must not stash a latch the first one has already cleared.
+BUDGET_ARMED_THIS_RUN=
+BUDGET_LATCH_STASHED=0
+BUDGET_PRIOR_LATCH=
+BUDGET_PRIOR_GAVE=
+
+budget_stash_latch() {
+  (( BUDGET_LATCH_STASHED )) && return 0
+  BUDGET_PRIOR_LATCH=$(state_get latched)
+  BUDGET_PRIOR_GAVE=$(state_get latched_gave)
+  BUDGET_LATCH_STASHED=1
+  state_clear latched
+  state_clear latched_gave
+}
+
+budget_arm() {
+  state_set "armed_$1" "$(budget_read_"$1")"
+  BUDGET_ARMED_THIS_RUN+=" $1"
+}
+
+# A raise that did not land must not leave the guard believing it did. Give up
+# the entries named, and put the latch back only when nothing this run armed
+# survives - a cpu-limit whose PL2 failed after PL1 landed has still raised a
+# budget, so its latch stays off.
+budget_abandon() {
+  local key
+  for key in "$@"; do state_clear "armed_$key"; done
+  for key in $BUDGET_ARMED_THIS_RUN; do
+    [[ -n $(state_get "armed_$key") ]] && return 0
+  done
+  state_set latched "$BUDGET_PRIOR_LATCH"
+  state_set latched_gave "$BUDGET_PRIOR_GAVE"
+}
+
+# What the guard would give back if it triggered right now.
+budget_plan() {
+  local key prior out=()
+  for key in $BUDGET_SETTINGS; do
+    prior=$(state_get "armed_$key")
+    [[ -n $prior ]] && out+=("$(budget_plan_"$key" "$prior")")
+  done
+  (( ${#out[@]} )) || { echo "nothing - no raised power budget to give back"; return 0; }
+  join_list "${out[@]}"
+}
+
+# Give back everything that can go back now, and latch. Echoes what this call
+# gave back; empty output and a non-zero status mean nothing went back.
+budget_give_back() {
+  local key prior phrase gave=() episode so_far
+  for key in $BUDGET_SETTINGS; do
+    prior=$(state_get "armed_$key")
+    [[ -n $prior ]] || continue
+    if phrase=$(budget_reverse_"$key" "$prior"); then
+      gave+=("$phrase")
+      state_clear "armed_$key"
+    fi
+  done
+  (( ${#gave[@]} )) || return 1
+  episode=$(join_list "${gave[@]}")
+
+  # The latch is one episode, not one give-back: it goes on when the guard
+  # first takes something back, and comes off only when the user raises again.
+  # So the moment stays put, and a later give-back adds to the summary.
+  so_far=$(state_get latched_gave)
+  state_set latched_gave "${so_far:+$so_far, }$episode"
+  [[ -n $(state_get latched) ]] || state_set latched "$(epoch)"
+  printf '%s\n' "$episode"
+}
+
+budget_latch_at() {
+  local t; t=$(state_get latched)
+  [[ -n $t ]] && date -d "@$t" '+%Y-%m-%d %H:%M' 2>/dev/null
+  return 0
+}
+
+budget_latch_gave() { state_get latched_gave; }
+
 # ------------------------------------------------------------------- the gate
 #
 # Confirmation is the moment the tool explains itself, so the prompt names the
 # setting, what it is now and what it would become, and says what the change is
 # and is not.
 #
-# gate <setting> <row>... where each row is "label|current|new".
+# gate <setting> <row>... where each row is "label|current|new" and may carry
+# a fourth field naming the armed-set key that the row raises.
 gate() {
   local setting=$1; shift
 
   # A refusal is worth as much in the log as a success, so it records what was
   # being asked for and not merely that something was declined. The first row is
   # the headline change; the rest, if any, come with it.
+  # A trailing field names the armed-set key, so it is read and dropped here:
+  # without it read would hand the last variable the remainder of the row.
   local gfrom=- gto=-
-  (( $# )) && IFS='|' read -r _ gfrom gto <<<"$1"
+  (( $# )) && IFS='|' read -r _ gfrom gto _ <<<"$1"
 
   # A CPU already in the guard's territory refuses the raise outright, and
   # --yes deliberately does not override this one: a scripting convenience must
@@ -313,23 +457,18 @@ gate() {
   # value is kept, because a raise that then fails to write has not re-enabled
   # anything and must not leave the latch off.
   GATE_SATISFIED=1
-  GATE_PRIOR_LATCH=$(state_get latched)
-  GATE_PRIOR_GAVE=$(state_get latched_gave)
-  state_clear latched
-  state_clear latched_gave
-  return 0
-}
+  budget_stash_latch
 
-# A raise that did not land must not leave the guard believing it did: give up
-# the values armed for it and put the latch back as the gate found it. Without
-# this, a refused write - `profile custom` returns EINVAL on this firmware -
-# would later have the guard "give back" a raise that never happened, moving the
-# machine up to performance rather than down.
-raise_failed() {
-  local key
-  for key in "$@"; do state_clear "$key"; done
-  state_set latched "$GATE_PRIOR_LATCH"
-  state_set latched_gave "$GATE_PRIOR_GAVE"
+  # Confirming is arming, so a raise cannot be approved without the guard being
+  # told what it may give back. Armed before the write, because the guard
+  # cannot give back what nobody wrote down, and given up again by
+  # budget_abandon when the write does not land.
+  local arm_row arm_parts
+  for arm_row in "$@"; do
+    IFS='|' read -r -a arm_parts <<<"$arm_row"
+    (( ${#arm_parts[@]} >= 4 )) && [[ -n ${arm_parts[3]} ]] && budget_arm "${arm_parts[3]}"
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------- status
@@ -351,9 +490,9 @@ cmd_status() {
   fi
   # Say so when the guard is holding the machine down, so a profile that will
   # not stick is never a mystery.
-  if [[ -n $(state_get latched) ]]; then
+  if [[ -n $(budget_latch_at) ]]; then
     printf '  thermal guard      latched %s: gave back %s\n' \
-      "$(latched_at)" "$(state_get latched_gave)"
+      "$(budget_latch_at)" "$(budget_latch_gave)"
     printf '                     and stays here until you raise a budget again\n'
   fi
 
@@ -429,10 +568,8 @@ cmd_profile() {
   local from armed_here=0
   from=$(rd $PROFILE)
   if raises_power "$want"; then
-    gate profile "platform profile|$from|$want" || return 1
-    # Recorded before the write, because the guard cannot give back what nobody
-    # wrote down - and given up again below if the write does not land.
-    state_set armed_profile "$from"; armed_here=1
+    gate profile "platform profile|$from|$want|profile" || return 1
+    armed_here=1
   fi
   local ppd; ppd=$(fw_to_ppd "$want")
   if have powerprofilesctl && powerprofilesctl list 2>/dev/null | grep -q "^ *\*\? *${ppd}:"; then
@@ -440,18 +577,18 @@ cmd_profile() {
     # AC/battery state, so it survives a reboot and an unplug.
     if have omarchy-powerprofiles-set; then
       omarchy-powerprofiles-set autodetect "$ppd" || {
-        (( armed_here )) && raise_failed armed_profile
+        (( armed_here )) && budget_abandon profile
         log_event "$ACTOR" profile "$from" "$want" failed "omarchy-powerprofiles-set failed"
         die "omarchy-powerprofiles-set $ppd failed"; }
     else
       powerprofilesctl set "$ppd" || {
-        (( armed_here )) && raise_failed armed_profile
+        (( armed_here )) && budget_abandon profile
         log_event "$ACTOR" profile "$from" "$want" failed "powerprofilesctl failed"
         die "powerprofilesctl set $ppd failed"; }
     fi
   else
     if ! wr $PROFILE "$want"; then
-      (( armed_here )) && raise_failed armed_profile
+      (( armed_here )) && budget_abandon profile
       log_event "$ACTOR" profile "$from" "$want" failed
       if [[ $want == custom ]]; then
         echo "note: this firmware lists 'custom' in platform_profile_choices but rejects" >&2
@@ -468,7 +605,7 @@ cmd_profile() {
   # that leaves the firmware where it was. Reconcile the two.
   if [[ $(rd $PROFILE) != "$want" ]]; then
     if ! wr $PROFILE "$want"; then
-      (( armed_here )) && raise_failed armed_profile
+      (( armed_here )) && budget_abandon profile
       log_event "$ACTOR" profile "$from" "$want" failed
       return 1
     fi
@@ -532,19 +669,17 @@ cmd_cpu_limit() {
 
   from1=$(rd $FWA/ppt_pl1_spl/current_value)
   from2=$(rd $FWA/ppt_pl2_sppt/current_value)
-  rows=("PL1 sustained|${from1} W|${pl1} W")
-  [[ -n $pl2 ]] && rows+=("PL2 burst|${from2} W|${pl2} W")
+  rows=("PL1 sustained|${from1} W|${pl1} W|cpu_pl1")
+  [[ -n $pl2 ]] && rows+=("PL2 burst|${from2} W|${pl2} W|cpu_pl2")
   gate cpu-limit "${rows[@]}" || return 1
-  state_set armed_cpu_pl1 "$from1"
-  [[ -n $pl2 ]] && state_set armed_cpu_pl2 "$from2"
 
   if ! wr_logged cpu-limit-pl1 $FWA/ppt_pl1_spl/current_value "$from1" "$pl1"; then
-    raise_failed armed_cpu_pl1 armed_cpu_pl2
+    budget_abandon cpu_pl1 cpu_pl2
     return 1
   fi
   if [[ -n $pl2 ]] && ! wr_logged cpu-limit-pl2 $FWA/ppt_pl2_sppt/current_value "$from2" "$pl2"; then
     # PL1 did land, so that half stays armed and the latch stays off.
-    state_clear armed_cpu_pl2
+    budget_abandon cpu_pl2
     return 1
   fi
   cmd_cpu_limit
@@ -561,10 +696,9 @@ cmd_gpu_limit() {
     return
   fi
   local from; from=$(gpu_power_limit)
-  gate gpu-limit "dGPU power cap|${from} W|${want} W" || return 1
-  state_set armed_gpu "$from"
+  gate gpu-limit "dGPU power cap|${from} W|${want} W|gpu" || return 1
   if ! sudo nvidia-smi -pl "$want" >/dev/null; then
-    raise_failed armed_gpu
+    budget_abandon gpu
     log_event "$ACTOR" gpu-limit "$from" "$want" failed
     die "failed to set GPU power limit"
   fi
@@ -652,66 +786,22 @@ sustained_for() { # <key> <over?> <now>
 # alone would leave a raised GPU cap in place, and the cap lives outside the
 # platform profile entirely.
 guard_act() { # <temp> <held-for>
-  local temp=$1 held=$2 acted=0 gave=()
+  local temp=$1 held=$2 gave
   ACTOR=guard
   LOG_DETAIL="CPU ${temp} C sustained ${held}s"
 
-  local prior
-  prior=$(state_get armed_profile)
-  if [[ -n $prior ]]; then
-    cmd_profile performance >/dev/null && gave+=("profile to performance")
-    state_clear armed_profile; acted=1
-  fi
-
-  prior=$(state_get armed_cpu_pl1)
-  if [[ -n $prior ]]; then
-    wr_logged cpu-limit-pl1 $FWA/ppt_pl1_spl/current_value \
-      "$(rd $FWA/ppt_pl1_spl/current_value)" "$prior" && gave+=("PL1 to ${prior} W")
-    state_clear armed_cpu_pl1; acted=1
-  fi
-
-  prior=$(state_get armed_cpu_pl2)
-  if [[ -n $prior ]]; then
-    wr_logged cpu-limit-pl2 $FWA/ppt_pl2_sppt/current_value \
-      "$(rd $FWA/ppt_pl2_sppt/current_value)" "$prior" && gave+=("PL2 to ${prior} W")
-    state_clear armed_cpu_pl2; acted=1
-  fi
-
-  prior=$(state_get armed_gpu)
-  # Only while the card is already awake. Monitoring must never be the thing
-  # that resumes a suspended dGPU, and a sleeping card draws nothing and adds no
-  # heat, so its raised cap can wait - it stays armed, and a later trigger gives
-  # it back once the card is up.
-  if [[ -n $prior && $(gpu_runtime_status) == active ]]; then
-    local default; default=$(gpu_default_limit)
-    # -n because this runs from a background service, where there is nobody to
-    # answer a password prompt; a refusal is recorded rather than waited on.
-    if [[ -n $default ]] && sudo -n nvidia-smi -pl "$default" >/dev/null 2>&1; then
-      log_event "$ACTOR" gpu-limit "$prior" "$default" applied
-      gave+=("dGPU cap to ${default} W")
-    else
-      log_event "$ACTOR" gpu-limit "$prior" "${default:--}" failed \
-        "nvidia-smi needs root, which a user service does not have"
-    fi
-    state_clear armed_gpu; acted=1
-  fi
-
-  (( acted )) || return 0
-
-  # Latch. Restoring automatically guarantees oscillation - drop, cool, restore,
-  # heat, drop - which would flap the profile and fill the log. The user
-  # re-enables deliberately, and the gate's hot refusal stops an immediate
-  # re-entry.
-  local gave_list; gave_list=$(join_list ${gave[@]+"${gave[@]}"})
-  state_set latched "$(epoch)"
-  state_set latched_gave "$gave_list"
+  # Latching rather than restoring on the way down: restoring automatically
+  # guarantees oscillation - drop, cool, restore, heat, drop - which would flap
+  # the profile and fill the log. The user re-enables deliberately, and the
+  # gate's hot refusal stops an immediate re-entry.
+  gave=$(budget_give_back) || { LOG_DETAIL=; return 0; }
 
   # The machine is by definition over the alert threshold too, and the guard's
   # notification is the one that explains what just happened. Count this as the
   # alert so the two do not arrive together.
   state_set alert_last "$(epoch)"
 
-  local body="${LOG_DETAIL}. Gave back: ${gave_list}."
+  local body="${LOG_DETAIL}. Gave back: ${gave}."
   body+=" It stays here until you raise it again."
   notify critical "Power budget given back" "$body"
   echo "guard: $body"
@@ -764,28 +854,9 @@ monitor_poll() {
   if (( verbose )); then
     printf 'CPU %s °C  (alert %s °C, guard %s °C)\n' "$temp" "$ALERT_TEMP" "$GUARD_TEMP"
     [[ -n $margin ]] && printf 'dGPU %s °C of thermal margin  (alert at %s °C)\n' "$margin" "$GPU_MARGIN"
-    printf 'the guard would: %s\n' "$(guard_plan)"
-    [[ -n $(state_get latched) ]] && printf 'guard: latched %s\n' "$(latched_at)"
+    printf 'the guard would: %s\n' "$(budget_plan)"
+    [[ -n $(budget_latch_at) ]] && printf 'guard: latched %s\n' "$(budget_latch_at)"
   fi
-  return 0
-}
-
-# What the guard would do if it triggered right now, in the terms it would act
-# in. The profile goes to performance rather than back to whatever it was, so
-# naming the prior value here would promise a restore that will not happen.
-guard_plan() {
-  local out=()
-  [[ -n $(state_get armed_profile) ]] && out+=("drop the profile to performance")
-  [[ -n $(state_get armed_cpu_pl1) ]] && out+=("return PL1 to $(state_get armed_cpu_pl1) W")
-  [[ -n $(state_get armed_cpu_pl2) ]] && out+=("return PL2 to $(state_get armed_cpu_pl2) W")
-  [[ -n $(state_get armed_gpu) ]] && out+=("return the dGPU cap to the card's default")
-  (( ${#out[@]} )) || { echo "nothing - no raised power budget to give back"; return 0; }
-  join_list "${out[@]}"
-}
-
-latched_at() {
-  local t; t=$(state_get latched)
-  [[ -n $t ]] && date -d "@$t" '+%Y-%m-%d %H:%M' 2>/dev/null
   return 0
 }
 

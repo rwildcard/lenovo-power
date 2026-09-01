@@ -284,3 +284,22 @@ setup() {
   [ "$(log_field 1 to)" = "135 W" ]
   [[ $(log_field 1 detail) == *terminal* ]]
 }
+
+@test "a preset that fails puts back the latch its first gate cleared" {
+  export LENOVO_POWER_GUARD_SUSTAIN=0
+  run "$LENOVO_POWER" profile max-power --yes
+  fake_cpu_temp 101
+  run "$LENOVO_POWER" monitor once
+  run "$LENOVO_POWER" status
+  local latched; latched=$(printf '%s\n' "$output" | grep "thermal guard")
+  [ -n "$latched" ]
+
+  # 'preset max' gates twice: once for the preset, once for the profile inside
+  # it. Only the first of those found a latch, so only it has one to put back.
+  fake_cpu_temp 55
+  chmod 444 "$LENOVO_POWER_SYSFS_ROOT/sys/firmware/acpi/platform_profile"
+  run "$LENOVO_POWER" preset max --yes
+
+  run "$LENOVO_POWER" status
+  [ "$(printf '%s\n' "$output" | grep "thermal guard")" = "$latched" ]
+}
