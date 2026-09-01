@@ -258,7 +258,24 @@ cmd_install_perms() {
   echo "This grants group 'wheel' write access to the Lenovo power sysfs knobs,"
   echo "so lenovo-power no longer needs sudo. Requires your password."
   echo
-  sudo "$installer"
+
+  if [[ -t 0 || -t 1 || -t 2 ]]; then
+    sudo "$installer"
+    return
+  fi
+
+  # No controlling terminal (launched from a keybind, an agent, or a shell
+  # wrapper), so sudo has nowhere to prompt. Fall back to a graphical askpass
+  # dialog if one is installed.
+  local askpass
+  for askpass in "${SUDO_ASKPASS:-}" /usr/lib/gcr4-ssh-askpass /usr/lib/gcr-ssh-askpass \
+                 /usr/lib/ssh/ssh-askpass /usr/libexec/openssh/gnome-ssh-askpass; do
+    [[ -n $askpass && -x $askpass ]] || continue
+    SUDO_ASKPASS="$askpass" sudo -A "$installer"
+    return
+  done
+
+  die "no terminal and no askpass helper found; run this from a terminal window"
 }
 
 usage() {
