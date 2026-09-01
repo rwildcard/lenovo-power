@@ -266,16 +266,23 @@ cmd_install_perms() {
 
   # No controlling terminal (launched from a keybind, an agent, or a shell
   # wrapper), so sudo has nowhere to prompt. Fall back to a graphical askpass
-  # dialog if one is installed.
+  # dialog if a usable one is installed.
+  #
+  # Deliberately excludes gcr's helpers (/usr/lib/gcr*-ssh-askpass): they abort
+  # with "this program is not meant to be run directly" unless invoked by gcr's
+  # own ssh-agent, so they are useless as a generic SUDO_ASKPASS.
   local askpass
-  for askpass in "${SUDO_ASKPASS:-}" /usr/lib/gcr4-ssh-askpass /usr/lib/gcr-ssh-askpass \
-                 /usr/lib/ssh/ssh-askpass /usr/libexec/openssh/gnome-ssh-askpass; do
+  for askpass in "${SUDO_ASKPASS:-}" /usr/lib/ssh/ssh-askpass \
+                 /usr/libexec/openssh/gnome-ssh-askpass \
+                 /usr/bin/lxqt-openssh-askpass /usr/bin/ksshaskpass; do
     [[ -n $askpass && -x $askpass ]] || continue
     SUDO_ASKPASS="$askpass" sudo -A "$installer"
     return
   done
 
-  die "no terminal and no askpass helper found; run this from a terminal window"
+  echo "No terminal to prompt on, and no usable askpass helper is installed." >&2
+  echo "Open a terminal window and run:  lenovo-power install-perms" >&2
+  exit 1
 }
 
 usage() {
