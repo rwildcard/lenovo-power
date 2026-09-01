@@ -82,7 +82,7 @@ setup() {
 
   run "$LENOVO_POWER" monitor once
 
-  [ -z "$(state_value armed_profile)" ]
+  [[ $output == *"nothing"* ]]
   [ -n "$(stub_calls notify-send)" ]
 }
 
@@ -97,8 +97,13 @@ setup() {
 
   [ "$status" -eq 0 ]
   [ "$(fake_value sys/firmware/acpi/platform_profile)" = performance ]
-  [ -n "$(state_value latched)" ]
-  [ -z "$(state_value armed_profile)" ]
+
+  fake_cpu_temp 55
+  run "$LENOVO_POWER" monitor once
+  [[ $output == *"nothing"* ]]
+
+  run "$LENOVO_POWER" status
+  [[ $output == *latched* ]]
 }
 
 @test "the guard gives a raised CPU limit back to its recorded prior value" {
@@ -118,13 +123,17 @@ setup() {
   fake_awake_gpu 40
   stub_permissive_sudo
   run "$LENOVO_POWER" gpu-limit 140 --yes
-  [ -n "$(state_value armed_gpu)" ]
+  run "$LENOVO_POWER" monitor once
+  [[ $output == *"dGPU cap"* ]]
   fake_cpu_temp 101
 
   run "$LENOVO_POWER" monitor once
 
   [[ $(stub_calls nvidia-smi) == *"-pl 70.00"* ]]
-  [ -z "$(state_value armed_gpu)" ]
+
+  fake_cpu_temp 55
+  run "$LENOVO_POWER" monitor once
+  [[ $output != *"dGPU cap"* ]]
 }
 
 @test "the guard reverses what was raised, not just the profile" {
@@ -174,7 +183,9 @@ setup() {
   run "$LENOVO_POWER" monitor once
 
   [ "$(fake_value sys/firmware/acpi/platform_profile)" = performance ]
-  [ -n "$(state_value latched)" ]
+
+  run "$LENOVO_POWER" status
+  [[ $output == *latched* ]]
 }
 
 @test "a hot machine with nothing raised has nothing to give back" {
@@ -185,7 +196,9 @@ setup() {
 
   [ "$status" -eq 0 ]
   [ "$(fake_value sys/firmware/acpi/platform_profile)" = balanced ]
-  [ -z "$(state_value latched)" ]
+
+  run "$LENOVO_POWER" status
+  [[ $output != *latched* ]]
 }
 
 @test "the guard waits for the temperature to be sustained" {
@@ -197,7 +210,9 @@ setup() {
   run "$LENOVO_POWER" monitor once
 
   [ "$(fake_value sys/firmware/acpi/platform_profile)" = max-power ]
-  [ -z "$(state_value latched)" ]
+
+  run "$LENOVO_POWER" status
+  [[ $output != *latched* ]]
 }
 
 # -------------------------------------------------------------------- dGPU
@@ -263,12 +278,14 @@ setup() {
   run "$LENOVO_POWER" profile max-power --yes
   fake_cpu_temp 101
   run "$LENOVO_POWER" monitor once
-  [ -n "$(state_value latched)" ]
+  run "$LENOVO_POWER" status
+  [[ $output == *latched* ]]
 
   fake_cpu_temp 55
   run "$LENOVO_POWER" profile max-power --yes
 
-  [ -z "$(state_value latched)" ]
+  run "$LENOVO_POWER" status
+  [[ $output != *latched* ]]
 }
 
 # ----------------------------------------------------------------- the loop
@@ -280,7 +297,8 @@ setup() {
 
   "$LENOVO_POWER" monitor run >/dev/null 2>&1 &
   local pid=$! waited=0
-  while [ -z "$(state_value latched)" ] && [ "$waited" -lt 50 ]; do
+  while [ "$(fake_value sys/firmware/acpi/platform_profile)" != performance ] &&
+        [ "$waited" -lt 50 ]; do
     sleep 0.1; waited=$((waited + 1))
   done
   kill "$pid" 2>/dev/null
@@ -335,7 +353,8 @@ setup() {
   fake_awake_gpu 40
   stub_permissive_sudo
   run "$LENOVO_POWER" gpu-limit 140 --yes
-  [ -n "$(state_value armed_gpu)" ]
+  run "$LENOVO_POWER" monitor once
+  [[ $output == *"dGPU cap"* ]]
 
   # The card goes to sleep before the machine gets hot.
   fake_file sys/bus/pci/devices/0000:01:00.0/power/runtime_status suspended
@@ -346,7 +365,7 @@ setup() {
 
   [ -z "$(stub_calls nvidia-smi)" ]
   # Still armed, so a later trigger can give it back once the card is up.
-  [ -n "$(state_value armed_gpu)" ]
+  [[ $output == *"dGPU cap"* ]]
 }
 
 @test "a single poll says what the guard would do right now" {

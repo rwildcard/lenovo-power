@@ -190,14 +190,21 @@ setup() {
 @test "the gate records the pre-raise profile so the guard can give it back" {
   run "$LENOVO_POWER" profile max-power --yes
 
-  [ "$(state_value armed_profile)" = balanced ]
+  # The plan names the profile but never the value it was raised from: a
+  # give-back goes to performance, so naming 'balanced' would promise a restore
+  # that does not happen.
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"drop the profile to performance"* ]]
 }
 
 @test "the gate records the pre-raise CPU limits" {
   run "$LENOVO_POWER" cpu-limit 135 210 --yes
 
-  [ "$(state_value armed_cpu_pl1)" = 55 ]
-  [ "$(state_value armed_cpu_pl2)" = 65 ]
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"return PL1 to 55 W"* ]]
+  [[ $output == *"return PL2 to 65 W"* ]]
 }
 
 @test "the gate records the pre-raise GPU cap" {
@@ -205,9 +212,13 @@ setup() {
   stub_permissive_sudo
 
   run "$LENOVO_POWER" gpu-limit 140 --yes
-
   [ "$status" -eq 0 ]
-  [ "$(state_value armed_gpu)" = 70.00 ]
+
+  # The armed set is the guard's, not the caller's, so ask the guard what it is
+  # holding rather than reading the record it keeps.
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"dGPU cap"* ]]
 }
 
 @test "a raise the hardware refuses arms nothing, so the guard has nothing to undo" {
@@ -216,8 +227,11 @@ setup() {
   run "$LENOVO_POWER" profile max-power --yes
 
   [ "$status" -ne 0 ]
-  [ -z "$(state_value armed_profile)" ]
   [ "$(log_field '$' outcome)" = failed ]
+
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"nothing"* ]]
 }
 
 @test "a raise the hardware refuses leaves the latch exactly as it found it" {
@@ -225,22 +239,29 @@ setup() {
   run "$LENOVO_POWER" profile max-power --yes
   fake_cpu_temp 101
   run "$LENOVO_POWER" monitor once
-  local latched; latched=$(state_value latched)
+
+  # The whole rendered line, so this covers the summary as well as the moment.
+  run "$LENOVO_POWER" status
+  local latched; latched=$(printf '%s\n' "$output" | grep "thermal guard")
   [ -n "$latched" ]
 
   fake_cpu_temp 55
   chmod 444 "$LENOVO_POWER_SYSFS_ROOT/sys/firmware/acpi/platform_profile"
   run "$LENOVO_POWER" profile max-power --yes
-
   [ "$status" -ne 0 ]
-  [ "$(state_value latched)" = "$latched" ]
+
+  run "$LENOVO_POWER" status
+
+  [ "$(printf '%s\n' "$output" | grep "thermal guard")" = "$latched" ]
 }
 
 @test "a raise that is refused arms nothing" {
   run "$LENOVO_POWER" profile max-power
-
   [ "$status" -ne 0 ]
-  [ -z "$(state_value armed_profile)" ]
+
+  run "$LENOVO_POWER" monitor once
+
+  [[ $output == *"nothing"* ]]
 }
 
 @test "a refusal records what was being asked for, and why it was declined" {
